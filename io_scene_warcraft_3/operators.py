@@ -238,7 +238,7 @@ class WarCraft3OperatorPushToNLA(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def _flatten_wc3_material(src):
+def _flatten_wc3_material(src, obj_color=(1.0, 1.0, 1.0, 1.0)):
     """Build a glTF-friendly copy of a WarCraft 3 material.
 
     The importer's materials route textures through ObjectInfo tints and
@@ -246,7 +246,12 @@ def _flatten_wc3_material(src):
     textures get dropped and re-imported models render untextured/black.
     The flat copy plugs the layer-0 texture straight into Base Color /
     Alpha (and Emission for unshaded or additive materials) so the
-    exporter embeds it. Returns None when no usable texture is found.
+    exporter embeds it.
+
+    obj_color is the source mesh's object color: the importer wires it
+    into ObjectInfo, where WC3 stores the layer tint and blend alpha
+    (e.g. additive splash quads tint warm at 30% alpha). Returns None
+    when no usable texture is found.
     """
     img = None
     unshaded = False
@@ -268,6 +273,9 @@ def _flatten_wc3_material(src):
     if img is None:
         return None
 
+    tint = (obj_color[0], obj_color[1], obj_color[2], 1.0)
+    tinted = abs(tint[0] - 1.0) + abs(tint[1] - 1.0) + abs(tint[2] - 1.0) > 0.01
+
     flat = bpy.data.materials.new('GLTF_' + src.name)
     flat.use_nodes = True
     fn = flat.node_tree.nodes
@@ -281,29 +289,55 @@ def _flatten_wc3_material(src):
         bsdf.inputs['Specular IOR Level'].default_value = 0.0
     tex = fn.new('ShaderNodeTexImage')
     tex.image = img
-    fl.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
-    if additive:
-        # Additive WC3 surfaces never occlude: bright texels add light,
-        # dark ones stay invisible. glTF has no additive blending, so
-        # approximate it with alpha = luminance(color) * texture alpha.
-        # A plain BLEND with the texture's alpha would turn dark glow
-        # textures (e.g. splash quads) into opaque black plates.
-        bw = fn.new('ShaderNodeRGBToBW')
+
+    color_out = tex.outputs['Color']
+    if tinted:
+        # texture color x layer tint (WC3 layer color via object color)
+        mix = fn.new('ShaderNodeMix')
+        mix.data_type = 'RGBA'
+        mix.blend_type = 'MULTIPLY'
+        mix.inputs[6].default_value = tint  # A
+        fl.new(tex.outputs['Color'], mix.inputs[7])  # B
+        color_out = mix.outputs[2]
+    fl.new(color_out, bsdf.inputs['Base Color'])
+
+    if additive and obj_color[3] < 0.9:
+        # Layered effects (layer alpha < 0.9, e.g. stacked splash-aura
+        # quads). WC3 adds texture * layerAlpha on every overlapping quad,
+        # while glTF BLEND darkens the more layers stack. Emulate the
+        # additive build-up with a small per-layer alpha (layerAlpha^2)
+        # paired with boosted emission (1/layerAlpha), so one layer adds
+        # as much light as WC3 and stacked layers keep getting brighter.
         mul = fn.new('ShaderNodeMath')
         mul.operation = 'MULTIPLY'
         mul.use_clamp = True
-        fl.new(tex.outputs['Color'], bw.inputs['Color'])
-        fl.new(bw.outputs['Val'], mul.inputs[0])
-        fl.new(tex.outputs['Alpha'], mul.inputs[1])
+        fl.new(tex.outputs['Alpha'], mul.inputs[0])
+        mul.inputs[1].default_value = obj_color[3] * obj_color[3]
         fl.new(mul.outputs['Value'], bsdf.inputs['Alpha'])
+    elif additive:
+        # Full-alpha additive surfaces: gate alpha by texel luminance so
+        # dark texels stay invisible instead of darkening the scene.
+        bw = fn.new('ShaderNodeRGBToBW')
+        gate = fn.new('ShaderNodeMath')
+        gate.operation = 'MULTIPLY'
+        gate.use_clamp = True
+        fl.new(tex.outputs['Color'], bw.inputs['Color'])
+        fl.new(bw.outputs['Val'], gate.inputs[0])
+        fl.new(tex.outputs['Alpha'], gate.inputs[1])
+        fl.new(gate.outputs['Value'], bsdf.inputs['Alpha'])
     else:
         fl.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
     if unshaded or additive:
         # glTF has emissiveTexture; preserves glows without scene lighting.
-        # The flat base color is already diffuse-lit, so full-strength
-        # emission double-brightens; 0.3 measured closest to the WC3 look.
+        # The emission input must be the raw texture: routing it through a
+        # tint Mix node makes the exporter fold the strength into
+        # emissiveFactor and clamp it at 1. Linked directly, strength > 1
+        # round-trips as KHR_materials_emissive_strength.
+        strength = 0.3
+        if additive and obj_color[3] < 0.9:
+            strength = min(3.5, 1.0 / obj_color[3])
         fl.new(tex.outputs['Color'], bsdf.inputs['Emission Color'])
-        bsdf.inputs['Emission Strength'].default_value = 0.3
+        bsdf.inputs['Emission Strength'].default_value = strength
     fl.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
     flat.use_backface_culling = src.use_backface_culling
     if hasattr(flat, 'surface_render_method') and hasattr(src, 'surface_render_method'):
@@ -321,7 +355,7 @@ def _swap_materials_for_gltf(export_objects):
     flat materials to remove afterwards.
     """
     swaps = []
-    by_name = {}
+    by_key = {}
     for obj in export_objects:
         if obj.type != 'MESH':
             continue
@@ -329,14 +363,16 @@ def _swap_materials_for_gltf(export_objects):
             src = slot.material
             if not src or not src.use_nodes:
                 continue
-            flat = by_name.get(src.name)
+            col = tuple(obj.color) if hasattr(obj, 'color') else (1.0, 1.0, 1.0, 1.0)
+            key = (src.name, round(col[0], 3), round(col[1], 3), round(col[2], 3), round(col[3], 3))
+            flat = by_key.get(key)
             if flat is None:
-                flat = _flatten_wc3_material(src)
-                by_name[src.name] = flat
+                flat = _flatten_wc3_material(src, col)
+                by_key[key] = flat
             if flat:
                 slot.material = flat
                 swaps.append((obj, i, src))
-    return swaps, [m for m in by_name.values() if m]
+    return swaps, [m for m in by_key.values() if m]
 
 
 class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper):

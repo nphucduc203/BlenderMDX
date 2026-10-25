@@ -102,6 +102,11 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 
 ## 📋 Changelog
 
+### v1.4.3
+- **Semi-transparent effect meshes visible again** (e.g. splash auras such as Moon Priestess `HeroMoonPriestess.017`): layered WC3 effects now export with `alpha = layerAlpha² × textureAlpha` plus boosted emission (`KHR_materials_emissive_strength`, exported reliably by linking the raw texture into Emission). One quad adds as much light as WC3 additive blending, and stacked quads keep getting brighter instead of darkening into a black plate.
+- **Full-alpha additive glows** (layer alpha ≥ 0.9) keep the luminance-gated alpha from v1.4.2: bright texels glow, dark texels stay invisible — no black plates, no dark smudges.
+- Verified on `2 (95).mdx`: 0% black pixels (was 32.5%), aura visible at WC3 strength, rider/mount colors match the MDX import.
+
 ### v1.4.2
 - **Fixed the "black plate" GLB bug**: additive WC3 materials (glows, splashes, ribbons) never occlude in-game, but the flattened export material used the texture's alpha channel with `BLEND` — dark additive textures (e.g. splash quads) re-imported as giant opaque black plates covering the model. Additive materials now export with `alpha = luminance(color) × texture alpha`, so bright texels glow and dark texels stay invisible, matching WC3.
 - **Balanced glow brightness**: the flat material combined diffuse lighting with full-strength emission, double-brightening everything. Emission strength is now 0.3, measured closest to the original WC3 render (pixel-diff improved ~43%).
@@ -229,6 +234,7 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 
 ## 📋 Lịch sử thay đổi (Tóm tắt)
 
+- **v1.4.3** — Hiện lại các mesh hiệu ứng bán trong suốt (aura/splash như `HeroMoonPriestess.017`): hiệu ứng nhiều lớp giờ xuất với `alpha = layerAlpha² × textureAlpha` + emission khuếch đại (`KHR_materials_emissive_strength`). Mỗi quad cộng sáng đúng như additive của WC3, chồng nhiều lớp càng sáng thay vì tụt thành tấm đen. Glow đầy đủ alpha giữ cơ chế luminance của v1.4.2. Kiểm chứng: 0% pixel đen (trước 32.5%), aura hiển thị đúng cường độ, màu khớp bản MDX.
 - **v1.4.2** — Sửa lỗi "tấm đen khổng lồ" khi mở GLB: material additive (glow/splash/ribbon) trước đây bị xuất thành mặt đen đặc che cả model; giờ alpha = độ sáng texture (sáng thì glow, tối thì trong suốt) đúng như WC3. Giảm độ sáng emission (0.3) hết hiện tượng chói/loang trắng. Kiểm chứng: hết 32.5% pixel đen, màu khớp bản gốc.
 - **v1.4.1** — Viết lại xuất GLB cho Godot: chỉ xuất đúng model (loại object preview hạt `W3_*`), làm phẳng material WC3 để texture không bị mất khi xuất (hết lỗi mesh đen), xuất kèm camera. Đã kiểm thử vòng khép kín: đủ 12 sequence, camera, material giữ đủ texture.
 - **v1.4.0** — Hỗ trợ MDX Reforged (VERS 1000); import camera (`CAMS`) và đèn (`LITE`); áp dụng global sequence (GLBS); lưu KATV/KEVT; sửa crash Blender 5.x khi import normal (test 148 model liên tục không crash); dọn action an toàn; tăng cường xử lý parser.
