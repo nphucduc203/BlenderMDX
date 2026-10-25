@@ -567,6 +567,27 @@ def create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages
         emitter_obj.location = (0.0, 0.0, 0.0)
         emitter_obj.rotation_euler = (0.0, 0.0, 0.0)
 
+        # Store emitter metadata for Godot GLB export (glTF extras)
+        emitter_obj['wc3_type'] = 'emitter'
+        emitter_obj['wc3_emitter_name'] = emitter_name
+        emitter_obj['wc3_bone'] = bone_name
+        emitter_obj['wc3_speed'] = float(emitter.speed * s)
+        emitter_obj['wc3_variation'] = float(emitter.variation)
+        emitter_obj['wc3_cone_angle'] = float(getattr(emitter, 'cone_angle', 0.0))
+        emitter_obj['wc3_gravity'] = float(getattr(emitter, 'gravity', 0.0) * s)
+        emitter_obj['wc3_life_span'] = float(emitter.life_span)
+        emitter_obj['wc3_emission_rate'] = float(emitter.emission_rate)
+        emitter_obj['wc3_width'] = float(emitter.width * s)
+        emitter_obj['wc3_length'] = float(emitter.length * s)
+        emitter_obj['wc3_filter_mode'] = int(emitter.filter_mode)
+        emitter_obj['wc3_rows'] = int(emitter.rows)
+        emitter_obj['wc3_columns'] = int(emitter.columns)
+        emitter_obj['wc3_colors'] = [[float(x) for x in c] for c in emitter.segment_colors]
+        emitter_obj['wc3_alphas'] = [float(a / 255.0) for a in emitter.segment_alphas]
+        emitter_obj['wc3_time_middle'] = float(getattr(emitter, 'time_middle', 0.5))
+        if tex_img:
+            emitter_obj['wc3_texture'] = tex_img.name
+
         # 4. Attach and configure Particle System
         try:
             ps_mod = emitter_obj.modifiers.new(name="W3_Particles", type='PARTICLE_SYSTEM')

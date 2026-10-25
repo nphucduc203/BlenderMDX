@@ -344,6 +344,13 @@ def _flatten_wc3_material(src, obj_color=(1.0, 1.0, 1.0, 1.0)):
         flat.surface_render_method = src.surface_render_method
     if hasattr(flat, 'alpha_threshold') and hasattr(src, 'alpha_threshold'):
         flat.alpha_threshold = src.alpha_threshold
+
+    # Store extras metadata for Godot Engine
+    flat['wc3_blend'] = 'additive' if additive else ('unshaded' if unshaded else 'blend')
+    flat['wc3_tint'] = [float(tint[0]), float(tint[1]), float(tint[2]), float(obj_color[3])]
+    flat['wc3_layer_alpha'] = float(obj_color[3])
+    flat['wc3_unshaded'] = bool(unshaded or additive)
+    flat['wc3_src_material'] = src.name
     return flat
 
 
@@ -372,6 +379,9 @@ def _swap_materials_for_gltf(export_objects):
             if flat:
                 slot.material = flat
                 swaps.append((obj, i, src))
+                if flat.get('wc3_blend') == 'additive':
+                    obj['wc3_blend'] = 'additive'
+                obj['wc3_color'] = [float(c) for c in col]
     return swaps, [m for m in by_key.values() if m]
 
 
@@ -400,13 +410,29 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
         # Ensure active object is arm
         context.view_layer.objects.active = arm
 
-        # Export ONLY the WarCraft 3 model: the armature plus its mesh /
-        # camera / light children. Blender-side preview helpers (W3_Inst_* /
-        # W3_Emitter_* particle objects) and unrelated scene objects are
-        # excluded so they do not reappear as stray geometry in Godot.
+        # Export the WarCraft 3 model: armature + mesh / camera / light children.
+        # W3_Inst_* billboard helpers are excluded so they do not leak geometry.
+        # W3_Emitter_* objects are converted into lightweight Empty marker nodes
+        # attached to bones, carrying particle parameters in glTF extras for Godot.
         export_set = {arm}
-        for child in arm.children:
-            if child.name.startswith('W3_'):
+        temp_empties = []
+        for child in list(arm.children):
+            if child.name.startswith('W3_Inst_'):
+                continue
+            if child.name.startswith('W3_Emitter_'):
+                empty = bpy.data.objects.new(child.name, None)
+                empty.parent = arm
+                empty.parent_type = child.parent_type
+                empty.parent_bone = child.parent_bone
+                empty.location = child.location
+                empty.rotation_euler = child.rotation_euler
+                empty.scale = child.scale
+                for k, v in child.items():
+                    if not k.startswith('_'):
+                        empty[k] = v
+                context.scene.collection.objects.link(empty)
+                export_set.add(empty)
+                temp_empties.append(empty)
                 continue
             if child.type in {'MESH', 'CAMERA', 'LIGHT', 'EMPTY'}:
                 export_set.add(child)
@@ -444,6 +470,7 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
                 export_materials='EXPORT',
                 export_cameras=True,
                 export_apply=False,
+                export_extras=True,
             )
             self.report({'INFO'}, f"Successfully exported for Godot: {os.path.basename(self.filepath)}")
             result = {'FINISHED'}
@@ -461,6 +488,11 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
             for tmp in temporaries:
                 try:
                     bpy.data.materials.remove(tmp, do_unlink=True)
+                except Exception:
+                    pass
+            for empty in temp_empties:
+                try:
+                    bpy.data.objects.remove(empty, do_unlink=True)
                 except Exception:
                     pass
         return result
