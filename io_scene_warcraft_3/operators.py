@@ -894,31 +894,14 @@ def _prepare_lossless_export_meshes(context, arm, export_set):
 
 def _prepare_compatible_export_meshes(context, arm, export_set):
     """
-    Standard PBR export preparation using frozen approximation formulas
-    (layerAlpha^2, luminance gating, boosted emission). Compatible everywhere.
+    Standard Vanilla PBR export:
+    - Pure character model ONLY: NO emitters, NO particle markers, NO emitter textures.
+    - Uses frozen approximation formulas (layerAlpha², luminance gating) for basic PBR viewers.
     """
     swaps = []
     temp_materials = []
     temp_empties = []
     by_key = {}
-
-    for child in list(arm.children):
-        if child.name.startswith('W3_Inst_'):
-            continue
-        if child.name.startswith('W3_Emitter_'):
-            empty = bpy.data.objects.new(child.name, None)
-            empty.parent = arm
-            empty.parent_type = child.parent_type
-            empty.parent_bone = child.parent_bone
-            empty.location = child.location
-            empty.rotation_euler = child.rotation_euler
-            empty.scale = child.scale
-            for k, v in child.items():
-                if not k.startswith('_'):
-                    empty[k] = v
-            context.scene.collection.objects.link(empty)
-            export_set.add(empty)
-            temp_empties.append(empty)
 
     for obj in list(export_set):
         if obj.type != 'MESH':
@@ -976,10 +959,13 @@ def _export_glb_core(operator, context, mode="lossless"):
 
     saved_action = arm.animation_data.action if arm.animation_data else None
 
-    if getattr(operator, 'exportAllActions', True):
-        bpy.ops.warcraft_3.push_to_nla(includeUnanimated=False)
-        if arm.animation_data:
-            arm.animation_data.action = None
+    # Remove temporary #UNANIMATED action if present so only real sequences export
+    unanim = bpy.data.actions.get('#UNANIMATED')
+    if unanim:
+        try:
+            bpy.data.actions.remove(unanim)
+        except Exception:
+            pass
 
     swaps = []
     temp_materials = []
@@ -1001,7 +987,7 @@ def _export_glb_core(operator, context, mode="lossless"):
             filepath=operator.filepath,
             export_format='GLB',
             use_selection=True,
-            export_animation_mode='NLA_TRACKS' if getattr(operator, 'exportAllActions', True) else 'ACTIVE_ACTIONS',
+            export_animation_mode='ACTIONS' if getattr(operator, 'exportAllActions', True) else 'ACTIVE_ACTIONS',
             export_anim_slide_to_zero=True,
             export_optimize_animation_size=False,
             export_image_format='AUTO',
