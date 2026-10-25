@@ -1069,7 +1069,7 @@ class WARCRAFT_3_OT_export_lossless_glb(bpy.types.Operator, io_utils.ExportHelpe
     skipOutlineShells: bpy.props.BoolProperty(
         name='Exclude Inverted-Hull Rim Shells',
         description='Exclude inverted-hull toon outline shell Geosets',
-        default=False
+        default=True
     )
     skipHiddenSpellMeshes: bpy.props.BoolProperty(
         name='Exclude Hidden / Unanimated Effect Meshes',
@@ -1173,7 +1173,7 @@ class WARCRAFT_3_OT_export_godot_glb(bpy.types.Operator, io_utils.ExportHelper):
     skipOutlineShells: bpy.props.BoolProperty(
         name='Exclude Inverted-Hull Rim Shells',
         description='Exclude inverted-hull toon outline shell Geosets',
-        default=False
+        default=True
     )
     skipHiddenSpellMeshes: bpy.props.BoolProperty(
         name='Exclude Hidden / Unanimated Effect Meshes',

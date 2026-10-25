@@ -1401,6 +1401,8 @@ def create_armature_actions(armatureObject, model, frameTime, bone_names):
     for sequence in sequences:
         intervalStart = sequence.interval_start
         intervalEnd = sequence.interval_end
+        seq_duration = intervalEnd - intervalStart
+        max_frame = round(seq_duration / frameTime) if frameTime > 0 else 0.0
         action = new_action(sequence.name, sequence.name)
         for indexNode, node in enumerate(nodes):
             translations = node.node.translations
@@ -1413,27 +1415,59 @@ def create_armature_actions(armatureObject, model, frameTime, bone_names):
             if translations:
                 interpolationType = constants.INTERPOLATION_TYPE_NAMES[translations.interpolation_type]
                 keys = list(_iter_track_keyframes(translations, intervalStart, intervalEnd, frameTime, global_sequences))
+                if keys:
+                    keys.sort(key=lambda k: k[0])
+                    if keys[0][0] > 0.0:
+                        keys.insert(0, (0.0, keys[0][1]))
+                    if keys[-1][0] < max_frame:
+                        keys.append((max_frame, keys[-1][1]))
                 if not _create_node_channel(action, armatureObject, dataPath + '.location', 3, keys, interpolationType):
                     for i in range(3):
                         fc = create_fcurve(action, armatureObject, dataPath + '.location', index=i)
                         fc.keyframe_points.insert(0.0, 0.0)
+                        fc.keyframe_points.insert(float(max_frame), 0.0)
             if rotations:
                 interpolationType = constants.INTERPOLATION_TYPE_NAMES[rotations.interpolation_type]
                 rotKeys = []
+                prev_euler = None
+                prev_q = None
                 for frame, quat in _iter_track_keyframes(rotations, intervalStart, intervalEnd, frameTime, global_sequences):
-                    euler = mathutils.Quaternion(mathutils.Vector(quat)).to_euler('XYZ')
+                    q = mathutils.Quaternion(quat)
+                    # Quaternion sign continuity: prevent 360-degree flips
+                    if prev_q is not None and q.dot(prev_q) < 0.0:
+                        q.negate()
+                    prev_q = q.copy()
+                    euler = q.to_euler('XYZ')
+                    # Euler continuity: prevent gimbal lock / wrapping jumps
+                    if prev_euler is not None:
+                        euler.make_compatible(prev_euler)
+                    prev_euler = euler.copy()
                     rotKeys.append((frame, (euler[0], euler[1], euler[2])))
+                if rotKeys:
+                    rotKeys.sort(key=lambda k: k[0])
+                    if rotKeys[0][0] > 0.0:
+                        rotKeys.insert(0, (0.0, rotKeys[0][1]))
+                    if rotKeys[-1][0] < max_frame:
+                        rotKeys.append((max_frame, rotKeys[-1][1]))
                 if not _create_node_channel(action, armatureObject, dataPath + '.rotation_euler', 3, rotKeys, interpolationType):
                     for i in range(3):
                         fc = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=i)
                         fc.keyframe_points.insert(0.0, 0.0)
+                        fc.keyframe_points.insert(float(max_frame), 0.0)
             if scalings:
                 interpolationType = constants.INTERPOLATION_TYPE_NAMES[scalings.interpolation_type]
                 keys = list(_iter_track_keyframes(scalings, intervalStart, intervalEnd, frameTime, global_sequences))
+                if keys:
+                    keys.sort(key=lambda k: k[0])
+                    if keys[0][0] > 0.0:
+                        keys.insert(0, (0.0, keys[0][1]))
+                    if keys[-1][0] < max_frame:
+                        keys.append((max_frame, keys[-1][1]))
                 if not _create_node_channel(action, armatureObject, dataPath + '.scale', 3, keys, interpolationType):
                     for i in range(3):
                         fc = create_fcurve(action, armatureObject, dataPath + '.scale', index=i)
                         fc.keyframe_points.insert(0.0, 1.0)
+                        fc.keyframe_points.insert(float(max_frame), 1.0)
 
 
 CAMERA_SENSOR_WIDTH_DEFAULT = 36.0
