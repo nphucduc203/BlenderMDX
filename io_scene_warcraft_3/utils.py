@@ -71,7 +71,7 @@ def set_animation(self, context):
             bpy.context.scene.frame_end = int(round(setAction.frame_range[1]))
             bpy.context.scene.frame_current = bpy.context.scene.frame_start
 
-    # 3. Synchronize child mesh actions for this sequence without cross-contaminating other models
+    # 3. Synchronize child object actions for this sequence without cross-contaminating other models
     for child in armatureObject.children:
         if child.type == 'MESH':
             child_act = None
@@ -83,6 +83,50 @@ def set_animation(self, context):
                 child_act = bpy.data.actions.get(f"{setAnimationName} {child.name}")
             if not child_act and target_action_name:
                 child_act = bpy.data.actions.get(f"{target_action_name} {child.name}")
+            if child_act:
+                if child.animation_data is None:
+                    child.animation_data_create()
+                child.animation_data.action = child_act
+        elif child.type == 'CAMERA':
+            obj_act = None
+            lens_act = None
+            for a in bpy.data.actions:
+                if a.get('wc3_object_name') != child.name or a.get('wc3_sequence_name') != setAnimationName:
+                    continue
+                channel = a.get('wc3_channel', 'object')
+                if channel == 'lens':
+                    lens_act = a
+                elif channel == 'object' and obj_act is None:
+                    obj_act = a
+            if obj_act:
+                if child.animation_data is None:
+                    child.animation_data_create()
+                child.animation_data.action = obj_act
+            if lens_act and child.data is not None:
+                if child.data.animation_data is None:
+                    child.data.animation_data_create()
+                child.data.animation_data.action = lens_act
+        elif child.type == 'LIGHT' and child.data is not None:
+            light_act = None
+            for a in bpy.data.actions:
+                if a.get('wc3_object_name') == child.data.name and a.get('wc3_sequence_name') == setAnimationName:
+                    light_act = a
+                    break
+            if not light_act:
+                for a in bpy.data.actions:
+                    if a.get('wc3_object_name') == child.name and a.get('wc3_sequence_name') == setAnimationName:
+                        light_act = a
+                        break
+            if light_act:
+                if child.data.animation_data is None:
+                    child.data.animation_data_create()
+                child.data.animation_data.action = light_act
+        elif child.type == 'EMPTY':
+            child_act = None
+            for a in bpy.data.actions:
+                if a.get('wc3_object_name') == child.name and a.get('wc3_sequence_name') == setAnimationName:
+                    child_act = a
+                    break
             if child_act:
                 if child.animation_data is None:
                     child.animation_data_create()
@@ -107,7 +151,7 @@ def set_bone_node_type(self, context):
             bone_collection = obj.data.collections.get(collection_name)
             
             if not bone_collection:
-                if nodeType in {'BONE', 'ATTACHMENT', 'COLLISION_SHAPE', 'EVENT', 'HELPER', 'EMITTER', 'RIBBON'}:
+                if nodeType in {'BONE', 'ATTACHMENT', 'COLLISION_SHAPE', 'EVENT', 'HELPER', 'EMITTER', 'RIBBON', 'LIGHT'}:
                     bone_collection = obj.data.collections.new(collection_name)
             
             if bone_collection:

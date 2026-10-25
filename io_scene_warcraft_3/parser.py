@@ -1,5 +1,6 @@
 
 import bpy
+import os
 from . import classes
 from . import constants
 from . import importer
@@ -47,6 +48,24 @@ def parse_material_texture_id(r):
             outTan = r.getf('<f')[0]
 
 
+def parse_track_float(r):
+    """Generic single-float animation track (KFOV, KLAS, KLAE, KLAI, KLBI, KLAV...)."""
+    track = classes.WarCraft3GeosetTransformation()
+    track.tracks_count = r.getf('<I')[0]
+    track.interpolation_type = r.getf('<I')[0]
+    globalSequenceId = r.getf('<I')[0]
+    track.global_sequence_id = globalSequenceId if globalSequenceId != 0xffffffff else None
+    for _ in range(track.tracks_count):
+        time = r.getf('<I')[0]
+        value = r.getf('<f')[0]
+        track.times.append(time)
+        track.values.append(value)
+        if track.interpolation_type > constants.INTERPOLATION_TYPE_LINEAR:
+            inTan = r.getf('<f')[0]
+            outTan = r.getf('<f')[0]
+    return track
+
+
 def parse_layers(data):
     r = binary.Reader(data)
     chunkId = r.getid(constants.CHUNK_LAYER)
@@ -63,11 +82,16 @@ def parse_layers(data):
         layer.coord_id = r.getf('<I')[0]
         layer.alpha = r.getf('<f')[0]
         while r.offset < inclusiveSize:
-            chunkId = r.getid(constants.SUB_CHUNKS_LAYER)
+            chunkId = r.getid()
             if chunkId == constants.CHUNK_MATERIAL_ALPHA:
                 layer.material_alpha = parse_material_alpha(r)
             elif chunkId == constants.CHUNK_MATERIAL_TEXTURE_ID:
                 layer.material_texture_id = parse_material_texture_id(r)
+            else:
+                r.offset -= 4    # unknown sub-chunk: resync to the layer boundary
+                break
+        if r.offset < inclusiveSize:
+            r.skip(inclusiveSize - r.offset)
         layers.append(layer)
     return layers
 
@@ -164,13 +188,18 @@ def parse_node(r):
         node.parent = None
     flags = r.getf('<I')[0]
     while r.offset < inclusiveSize:
-        chunkId = r.getid(constants.SUB_CHUNKS_NODE)
+        chunkId = r.getid()
         if chunkId == constants.CHUNK_GEOSET_TRANSLATION:
             node.translations = parse_geoset_translation(r)
         elif chunkId == constants.CHUNK_GEOSET_ROTATION:
             node.rotations = parse_geoset_rotation(r)
         elif chunkId == constants.CHUNK_GEOSET_SCALING:
             node.scalings = parse_geoset_scaling(r)
+        else:
+            r.offset -= 4    # unknown sub-chunk: resync to the node boundary
+            break
+    if r.offset < inclusiveSize:
+        r.skip(inclusiveSize - r.offset)
     return node
 
 
@@ -312,6 +341,7 @@ def parse_attachment_visibility(r):
     visibility.tracks_count = r.getf('<I')[0]
     visibility.interpolation_type = r.getf('<I')[0]
     globalSequenceId = r.getf('<I')[0]
+    visibility.global_sequence_id = globalSequenceId if globalSequenceId != 0xffffffff else None
     for _ in range(visibility.tracks_count):
         time = r.getf('<I')[0]
         value = r.getf('<f')[0]    # visibility value
@@ -320,6 +350,7 @@ def parse_attachment_visibility(r):
         if visibility.interpolation_type > constants.INTERPOLATION_TYPE_LINEAR:
             inTan = r.getf('<f')[0]
             outTan = r.getf('<f')[0]
+    return visibility
 
 
 def parse_attachment(data, model):
@@ -330,7 +361,7 @@ def parse_attachment(data, model):
     path = r.gets(260)
     attachmentId = r.getf('<I')[0]
     if r.offset < dataSize:
-        parse_attachment_visibility(r)
+        attachment.visibility = parse_attachment_visibility(r)
     model.nodes.append(attachment)
 
 
@@ -364,25 +395,23 @@ def parse_pivot_points(data, model):
         model.pivot_points.append(r.getf('<3f'))
 
 
-def parse_tracks(r):
-    tracksCount = r.getf('<I')[0]
-    globalSequenceId = r.getf('<I')[0]
-    for _ in range(tracksCount):
-        time = r.getf('<I')[0]
-
-
 def parse_events(data, model):
     dataSize = len(data)
     r = binary.Reader(data)
     while r.offset < dataSize:
         event = classes.WarCraft3Event()
         event.node = parse_node(r)
-        if r.offset < dataSize:
-            chunkId = r.gets(4)
+        if r.offset + 4 <= dataSize:
+            chunkId = r.getid()
             if chunkId == constants.CHUNK_TRACKS:
-                parse_tracks(r)
+                tracksCount = r.getf('<I')[0]
+                globalSequenceId = r.getf('<i')[0]
+                event.global_sequence_id = globalSequenceId if globalSequenceId != -1 else None
+                for _ in range(tracksCount):
+                    event.tracks.append(r.getf('<I')[0])
             else:
                 r.offset -= 4
+                break    # cannot resync without a track chunk; skip the rest
         model.nodes.append(event)
 
 
@@ -475,11 +504,16 @@ def parse_geoset_animations(data, model):
         geosetAnimation.flags = flags
         geosetAnimation.color = rgb
         while r.offset < inclusiveSize:
-            chunkId = r.getid(constants.SUB_CHUNKS_GEOSET_ANIMATION)
+            chunkId = r.getid()
             if chunkId == constants.CHUNK_GEOSET_COLOR:
                 geosetAnimation.animation_color = parse_geoset_color(r)
             elif chunkId == constants.CHUNK_GEOSET_ALPHA:
                 geosetAnimation.animation_alpha = parse_geoset_alpha(r)
+            else:
+                r.offset -= 4    # unknown sub-chunk: resync to the entry boundary
+                break
+        if r.offset < inclusiveSize:
+            r.skip(inclusiveSize - r.offset)
         if not geosetAnimation.animation_color:
             geosetColor = classes.WarCraft3GeosetTransformation()
             geosetColor.tracks_count = 1
@@ -504,6 +538,80 @@ def parse_global_sequences(data, model):
     for _ in range(count):
         duration = r.getf('<I')[0]
         model.global_sequences.append(duration)
+
+
+def parse_cameras(data, model):
+    """CAMS: [inclusiveSize][name][position][fov][far][near][target][KCTR/KFOV/KCRL/KTTR...]."""
+    r = binary.Reader(data)
+    dataSize = len(data)
+    while r.offset < dataSize:
+        camera = classes.WarCraft3Camera()
+        inclusiveSize = r.offset + r.getf('<I')[0]
+        camera.name = r.gets(80)
+        camera.position = r.getf('<3f')
+        camera.field_of_view = r.getf('<f')[0]
+        camera.far_clipping_plane = r.getf('<f')[0]
+        camera.near_clipping_plane = r.getf('<f')[0]
+        camera.target_position = r.getf('<3f')
+        while r.offset < inclusiveSize:
+            chunkId = r.getid()
+            if chunkId == constants.CHUNK_CAMERA_TRANSLATION:
+                camera.translations = parse_geoset_translation(r)
+            elif chunkId == constants.CHUNK_CAMERA_TARGET_TRANSLATION:
+                camera.target_translations = parse_geoset_translation(r)
+            elif chunkId == constants.CHUNK_CAMERA_FOV:
+                camera.fov_track = parse_track_float(r)
+            elif chunkId == constants.CHUNK_CAMERA_ROTATION:
+                camera.roll_track = parse_track_float(r)
+            else:
+                r.offset -= 4
+                break
+        if r.offset < inclusiveSize:
+            r.skip(inclusiveSize - r.offset)
+        elif r.offset > inclusiveSize:
+            r.offset = inclusiveSize
+        model.cameras.append(camera)
+
+
+def parse_lights(data, model):
+    """LITE: [inclusiveSize][node][type][attenuation][color][intensity][ambient...][KLAS/KLAE/KLAC/KLAI/KLBI/KLBC/KLAV]."""
+    r = binary.Reader(data)
+    dataSize = len(data)
+    while r.offset < dataSize:
+        inclusiveSize = r.offset + r.getf('<I')[0]
+        light = classes.WarCraft3Light()
+        light.node = parse_node(r)
+        light.light_type = r.getf('<I')[0]
+        light.attenuation = r.getf('<2f')
+        light.color = r.getf('<3f')
+        light.intensity = r.getf('<f')[0]
+        light.ambient_color = r.getf('<3f')
+        light.ambient_intensity = r.getf('<f')[0]
+        while r.offset < inclusiveSize:
+            chunkId = r.getid()
+            if chunkId == constants.CHUNK_LIGHT_ATTENUATION_START:
+                light.attenuation_start_track = parse_track_float(r)
+            elif chunkId == constants.CHUNK_LIGHT_ATTENUATION_END:
+                light.attenuation_end_track = parse_track_float(r)
+            elif chunkId == constants.CHUNK_LIGHT_COLOR:
+                light.color_track = parse_geoset_translation(r)     # vec3 track, same layout
+            elif chunkId == constants.CHUNK_LIGHT_INTENSITY:
+                light.intensity_track = parse_track_float(r)
+            elif chunkId == constants.CHUNK_LIGHT_AMBIENT_INTENSITY:
+                light.ambient_intensity_track = parse_track_float(r)
+            elif chunkId == constants.CHUNK_LIGHT_AMBIENT_COLOR:
+                light.ambient_color_track = parse_geoset_translation(r)
+            elif chunkId == constants.CHUNK_LIGHT_VISIBILITY:
+                light.visibility_track = parse_track_float(r)
+            else:
+                r.offset -= 4
+                break
+        if r.offset < inclusiveSize:
+            r.skip(inclusiveSize - r.offset)
+        elif r.offset > inclusiveSize:
+            r.offset = inclusiveSize
+        model.nodes.append(light)
+        model.lights.append(light)
 
 
 def parse_texture_animations(data, model):
@@ -615,11 +723,15 @@ def parse_ribbon_emitters(data, model):
         model.ribbon_emitters.append(emitter)
 
 
-def parse_version(data):
+def parse_version(data, model):
     r = binary.Reader(data)
     version = r.getf('<I')[0]
-    if version != constants.MDX_CURRENT_VERSION:
-        raise Exception('unsupported MDX format version: {0}'.format(version))
+    model.version = version
+    if version not in constants.MDX_SUPPORTED_VERSIONS:
+        # Reforged (1000) and newer tools may write other values while keeping the
+        # classic layout; warn and continue instead of aborting the whole import.
+        print('[WarCraft 3] Warning: unusual MDX format version {0}; '
+              'attempting to load it anyway.'.format(version))
 
 
 def parse_mdx(data, importProperties):
@@ -633,7 +745,7 @@ def parse_mdx(data, importProperties):
         chunkData = data[r.offset : r.offset + chunkSize]
         r.skip(chunkSize)
         if chunkId == constants.CHUNK_VERSION:
-            parse_version(chunkData)
+            parse_version(chunkData, model)
         elif chunkId == constants.CHUNK_GEOSET:
             parse_geosets(chunkData, model)
         elif chunkId == constants.CHUNK_TEXTURE:
@@ -668,11 +780,21 @@ def parse_mdx(data, importProperties):
             parse_particle_emitters_2(chunkData, model)
         elif chunkId == constants.CHUNK_RIBBON_EMITTER:
             parse_ribbon_emitters(chunkData, model)
+        elif chunkId == constants.CHUNK_CAMERA:
+            parse_cameras(chunkData, model)
+        elif chunkId == constants.CHUNK_LIGHT:
+            parse_lights(chunkData, model)
     return importer.load_warcraft_3_model(model, importProperties)
 
 
 def load_mdx(importProperties):
-    mdxFile = open(importProperties.mdx_file_path, 'rb')
+    mdxPath = importProperties.mdx_file_path
+    if mdxPath.lower().endswith('.mdl'):
+        raise Exception(
+            '"{0}" is a .mdl (text format) file. This addon imports the binary '
+            '.mdx format only - convert the model to .mdx with Retera Model '
+            'Studio (File > Save As) and try again.'.format(os.path.basename(mdxPath)))
+    mdxFile = open(mdxPath, 'rb')
     mdxFileData = mdxFile.read()
     mdxFile.close()
     return parse_mdx(mdxFileData, importProperties)

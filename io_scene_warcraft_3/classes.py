@@ -4,6 +4,7 @@ import bpy
 class WarCraft3Model:
     def __init__(self):
         self.name = None
+        self.version = None
         self.meshes = []
         self.materials = []
         self.textures = []
@@ -16,6 +17,8 @@ class WarCraft3Model:
         self.particle_emitters = []
         self.particle_emitters_2 = []
         self.ribbon_emitters = []
+        self.cameras = []
+        self.lights = []
 
     def normalize_meshes_names(self):
         for mesh in self.meshes:
@@ -38,12 +41,15 @@ class WarCraft3Attachment:
     def __init__(self):
         self.type = 'attachment'
         self.node = None
+        self.visibility = None
 
 
 class WarCraft3Event:
     def __init__(self):
         self.type = 'event'
         self.node = None
+        self.global_sequence_id = None
+        self.tracks = []
 
 
 class WarCraft3CollisionShape:
@@ -114,6 +120,39 @@ class WarCraft3TextureAnimation:
         self.translations = None
         self.rotations = None
         self.scalings = None
+
+
+class WarCraft3Camera:
+    def __init__(self):
+        self.name = None
+        self.position = (0.0, 0.0, 0.0)
+        self.field_of_view = 0.0    # radians
+        self.far_clipping_plane = 0.0
+        self.near_clipping_plane = 0.0
+        self.target_position = (0.0, 0.0, 0.0)
+        self.translations = None           # KCTR
+        self.target_translations = None    # KTTR
+        self.fov_track = None              # KFOV (classic, radians)
+        self.roll_track = None             # KCRL (Reforged, radians)
+
+
+class WarCraft3Light:
+    def __init__(self):
+        self.type = 'light'
+        self.node = None
+        self.light_type = 0                # 0 = omnidirectional, 1 = directional, 2 = ambient
+        self.attenuation = (0.0, 0.0)      # start, end
+        self.color = (1.0, 1.0, 1.0)
+        self.intensity = 0.0
+        self.ambient_color = (0.0, 0.0, 0.0)
+        self.ambient_intensity = 0.0
+        self.attenuation_start_track = None    # KLAS
+        self.attenuation_end_track = None      # KLAE
+        self.color_track = None                # KLAC
+        self.intensity_track = None            # KLAI
+        self.ambient_intensity_track = None    # KLBI
+        self.ambient_color_track = None        # KLBC
+        self.visibility_track = None           # KLAV
 
 
 class WarCraft3Node:

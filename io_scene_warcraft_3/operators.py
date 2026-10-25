@@ -185,7 +185,7 @@ class WarCraft3OperatorUpdateBoneSettings(bpy.types.Operator):
                 collection_name = nodeType.lower() + 's'
                 bone_collection = arm.data.collections.get(collection_name)
                 if not bone_collection:
-                    if nodeType in {'BONE', 'ATTACHMENT', 'COLLISION_SHAPE', 'EVENT', 'HELPER'}:
+                    if nodeType in {'BONE', 'ATTACHMENT', 'COLLISION_SHAPE', 'EVENT', 'HELPER', 'EMITTER', 'RIBBON', 'LIGHT'}:
                         bone_collection = arm.data.collections.new(collection_name)
                 if bone_collection:
                     bone_collection.assign(bone)
@@ -238,10 +238,94 @@ class WarCraft3OperatorPushToNLA(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _flatten_wc3_material(src):
+    """Build a glTF-friendly copy of a WarCraft 3 material.
+
+    The importer's materials route textures through ObjectInfo tints and
+    Add-Shader emission, which the glTF exporter cannot translate — the
+    textures get dropped and re-imported models render untextured/black.
+    The flat copy plugs the layer-0 texture straight into Base Color /
+    Alpha (and Emission for unshaded or additive materials) so the
+    exporter embeds it. Returns None when no usable texture is found.
+    """
+    img = None
+    unshaded = False
+    additive = False
+    if not src.use_nodes:
+        return None
+    nodes = src.node_tree.nodes
+    out_node = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if out_node and out_node.inputs['Surface'].is_linked:
+        surface = out_node.inputs['Surface'].links[0].from_node
+        additive = surface.type == 'ADD_SHADER'
+    for n in nodes:
+        if n.type == 'BSDF_PRINCIPLED' and n.inputs.get('Emission Color') and n.inputs['Emission Color'].is_linked:
+            unshaded = True
+    for n in nodes:  # layer-0 texture node is created first by the importer
+        if n.type == 'TEX_IMAGE' and n.image:
+            img = n.image
+            break
+    if img is None:
+        return None
+
+    flat = bpy.data.materials.new('GLTF_' + src.name)
+    flat.use_nodes = True
+    fn = flat.node_tree.nodes
+    fl = flat.node_tree.links
+    fn.clear()
+    out = fn.new('ShaderNodeOutputMaterial')
+    bsdf = fn.new('ShaderNodeBsdfPrincipled')
+    bsdf.inputs['Roughness'].default_value = 0.8
+    bsdf.inputs['Metallic'].default_value = 0.0
+    if 'Specular IOR Level' in bsdf.inputs:
+        bsdf.inputs['Specular IOR Level'].default_value = 0.0
+    tex = fn.new('ShaderNodeTexImage')
+    tex.image = img
+    fl.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
+    fl.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
+    if unshaded or additive:
+        # glTF has emissiveTexture; preserves glows without scene lighting
+        fl.new(tex.outputs['Color'], bsdf.inputs['Emission Color'])
+        bsdf.inputs['Emission Strength'].default_value = 1.0
+    fl.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+    flat.use_backface_culling = src.use_backface_culling
+    if hasattr(flat, 'surface_render_method') and hasattr(src, 'surface_render_method'):
+        flat.surface_render_method = src.surface_render_method
+    if hasattr(flat, 'alpha_threshold') and hasattr(src, 'alpha_threshold'):
+        flat.alpha_threshold = src.alpha_threshold
+    return flat
+
+
+def _swap_materials_for_gltf(export_objects):
+    """Temporarily replace WC3 node materials with flat glTF ones.
+
+    Returns (swaps, temporaries): swaps is a list of (mesh, slot index,
+    original material) used to restore after export; temporaries are the
+    flat materials to remove afterwards.
+    """
+    swaps = []
+    by_name = {}
+    for obj in export_objects:
+        if obj.type != 'MESH':
+            continue
+        for i, slot in enumerate(obj.material_slots):
+            src = slot.material
+            if not src or not src.use_nodes:
+                continue
+            flat = by_name.get(src.name)
+            if flat is None:
+                flat = _flatten_wc3_material(src)
+                by_name[src.name] = flat
+            if flat:
+                slot.material = flat
+                swaps.append((obj, i, src))
+    return swaps, [m for m in by_name.values() if m]
+
+
 class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper):
     bl_idname = 'warcraft_3.export_godot_glb'
     bl_label = 'Export for Godot (.glb)'
-    bl_description = 'Export model, embedded textures, and all animation sequences ready for Godot Engine'
+    bl_description = 'Export model, embedded textures, and all animation sequences ready for Godot Engine (excludes Blender particle helpers, flattens WC3 shaders to glTF-safe materials)'
     bl_options = {'UNDO'}
 
     filename_ext = '.glb'
@@ -262,7 +346,21 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
 
         # Ensure active object is arm
         context.view_layer.objects.active = arm
-        arm.select_set(True)
+
+        # Export ONLY the WarCraft 3 model: the armature plus its mesh /
+        # camera / light children. Blender-side preview helpers (W3_Inst_* /
+        # W3_Emitter_* particle objects) and unrelated scene objects are
+        # excluded so they do not reappear as stray geometry in Godot.
+        export_set = {arm}
+        for child in arm.children:
+            if child.name.startswith('W3_'):
+                continue
+            if child.type in {'MESH', 'CAMERA', 'LIGHT', 'EMPTY'}:
+                export_set.add(child)
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in export_set:
+            obj.select_set(True)
+        context.view_layer.objects.active = arm
 
         # Ensure all skinned meshes are parented to Armature for glTF
         for obj in context.scene.objects:
@@ -277,24 +375,42 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
         if self.exportAllActions:
             bpy.ops.warcraft_3.push_to_nla()
 
+        # WC3 node materials (ObjectInfo tint / Add-Shader emission) are not
+        # glTF-translatable; swap in flat textured copies for the export.
+        swaps, temporaries = _swap_materials_for_gltf(export_set)
+
         try:
             bpy.ops.export_scene.gltf(
                 filepath=self.filepath,
                 export_format='GLB',
+                use_selection=True,
                 export_animation_mode='NLA_TRACKS' if self.exportAllActions else 'ACTIVE_ACTIONS',
                 export_anim_slide_to_zero=True,
                 export_optimize_animation_size=True,
                 export_image_format='AUTO',
                 export_materials='EXPORT',
+                export_cameras=True,
                 export_apply=False,
             )
             self.report({'INFO'}, f"Successfully exported for Godot: {os.path.basename(self.filepath)}")
-            return {'FINISHED'}
+            result = {'FINISHED'}
         except Exception as e:
             self.report({'ERROR'}, f"Failed to export GLB: {e}")
             import traceback
             traceback.print_exc()
-            return {'CANCELLED'}
+            result = {'CANCELLED'}
+        finally:
+            for obj, idx, src in swaps:
+                try:
+                    obj.material_slots[idx].material = src
+                except Exception:
+                    pass
+            for tmp in temporaries:
+                try:
+                    bpy.data.materials.remove(tmp, do_unlink=True)
+                except Exception:
+                    pass
+        return result
 
     def invoke(self, context, event):
         arm = find_scene_armature(context)

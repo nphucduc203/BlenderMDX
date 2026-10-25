@@ -25,7 +25,8 @@ class WarCraft3BoneProperties(bpy.types.PropertyGroup):
             ('EVENT', 'Event', ''),
             ('COLLISION_SHAPE', 'Collision Shape', ''),
             ('EMITTER', 'Emitter', ''),
-            ('RIBBON', 'Ribbon', '')
+            ('RIBBON', 'Ribbon', ''),
+            ('LIGHT', 'Light', '')
         ],
         name='Node Type',
         update=utils.set_bone_node_type,

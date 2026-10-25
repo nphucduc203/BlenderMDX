@@ -274,12 +274,18 @@ def animate_texture_animations(model, bpyMaterials, frameTime):
 
 
 def purge_orphaned_wc3_actions():
-    """Purge orphaned actions created by Warcraft 3 plugin that have no active object in the scene."""
+    """Purge orphaned actions created by this addon.
+
+    Only touches actions tagged by the addon (wc3_armature_name /
+    wc3_object_name); actions from other addons or the user are left alone.
+    """
     existing_armatures = {obj.name for obj in bpy.data.objects if obj.type == 'ARMATURE'}
     existing_meshes = {obj.name for obj in bpy.data.objects if obj.type == 'MESH'}
     for act in list(bpy.data.actions):
         arm_tag = act.get('wc3_armature_name', None)
         obj_tag = act.get('wc3_object_name', None)
+        if arm_tag is None and obj_tag is None:
+            continue    # not created by this addon - never delete
         if arm_tag and arm_tag not in existing_armatures:
             try:
                 bpy.data.actions.remove(act)
@@ -617,8 +623,20 @@ def load_warcraft_3_model(model, importProperties):
     if hasattr(importProperties, 'global_scale'):
         s = importProperties.global_scale
         armatureObject.scale = (s, s, s)
-    
+
     armatureObject.rotation_euler[2] = -math.radians(90.0)
+
+    # Cameras and lights (created after scaling so clip ranges match)
+    if model.cameras:
+        try:
+            create_cameras(model, armatureObject, importProperties.frame_time)
+        except Exception as e:
+            print('[WarCraft 3] Error importing cameras: {0}'.format(e))
+    if model.lights:
+        try:
+            create_lights(model, armatureObject, bone_names, importProperties.frame_time)
+        except Exception as e:
+            print('[WarCraft 3] Error importing lights: {0}'.format(e))
 
     create_armature_actions(armatureObject, model, importProperties.frame_time, bone_names)
     create_object_actions(model, bpyObjects, importProperties.frame_time, armatureObject)
@@ -1041,10 +1059,18 @@ def create_mesh_objects(model, importProperties):
         for poly in bpyMesh.polygons:
             poly.use_smooth = True
 
-        # Custom split normals from Warcraft 3
-        if hasattr(warCraft3Mesh, 'normals') and warCraft3Mesh.normals and len(warCraft3Mesh.normals) == len(warCraft3Mesh.vertices):
+        # Custom split normals from Warcraft 3. Zero-length or NaN normals are
+        # replaced with +Z and the mesh is validated first: on Blender 5.x the
+        # custom-normals API can crash the whole process otherwise once several
+        # models have been imported in the same session.
+        if hasattr(warCraft3Mesh, 'normals') and warCraft3Mesh.normals and len(warCraft3Mesh.normals) == len(warCraft3Mesh.vertices) and len(bpyMesh.polygons) > 0:
             try:
-                bpyMesh.normals_split_custom_set_from_vertices(warCraft3Mesh.normals)
+                safeNormals = [
+                    (0.0, 0.0, 1.0) if not (n[0] * n[0] + n[1] * n[1] + n[2] * n[2] > 1e-12) else n
+                    for n in warCraft3Mesh.normals
+                ]
+                bpyMesh.validate()
+                bpyMesh.normals_split_custom_set([safeNormals[loop.vertex_index] for loop in bpyMesh.loops])
             except Exception:
                 pass
 
@@ -1165,160 +1191,317 @@ def add_sequence_to_armature(sequenceName, armatureObject, actionName=None):
     sequence.action_name = actionName or sequenceName
 
 
+def _iter_track_keyframes(track, intervalStart, intervalEnd, frameTime, global_sequences):
+    """Yield (frame, value) pairs of a track within one animation sequence.
+
+    Normal tracks contribute the keyframes whose time falls inside
+    [intervalStart, intervalEnd], rebased so the sequence starts at frame 0.
+    Global-sequence tracks loop with their own period regardless of the
+    playing sequence, so they are unrolled (phase 0 at sequence start) across
+    the whole sequence length.
+    """
+    if track is None or not track.times:
+        return
+    gsid = getattr(track, 'global_sequence_id', None)
+    isGlobal = gsid is not None and 0 <= gsid < len(global_sequences)
+    seqLen = intervalEnd - intervalStart
+    if isGlobal:
+        period = global_sequences[gsid]
+        if period <= 0:
+            period = max(seqLen, 1)
+        for index in range(track.tracks_count):
+            time = track.times[index]
+            value = track.values[index]
+            t = time
+            while t <= seqLen:
+                if t >= 0:
+                    yield (round(t / frameTime), value)
+                t += period
+        return
+    for index in range(track.tracks_count):
+        time = track.times[index]
+        if intervalStart <= time and time <= intervalEnd:
+            yield (round((time - intervalStart) / frameTime), track.values[index])
+
+
+def _create_node_channel(action, datablock, dataPath, axisCount, keyframes, interpolationType):
+    """Create one animated channel (XYZ axes) on an action.
+
+    Returns True when at least one axis received real keyframes.
+    """
+    if keyframes:
+        fcurves = [create_fcurve(action, datablock, dataPath, index=i) for i in range(axisCount)]
+        for frame, value in keyframes:
+            for i in range(axisCount):
+                key = fcurves[i].keyframe_points.insert(float(frame), value[i] if i < len(value) else 0.0)
+                key.interpolation = interpolationType
+        return True
+    return False
+
+
 def create_armature_actions(armatureObject, model, frameTime, bone_names):
     nodes = model.nodes
     sequences = model.sequences
+    global_sequences = model.global_sequences
 
-    old_act = bpy.data.actions.get('#UNANIMATED')
-    if old_act and old_act.users == 0:
-        try:
-            bpy.data.actions.remove(old_act)
-        except Exception:
-            pass
-
-    action = bpy.data.actions.new(name='#UNANIMATED')
-    action.use_fake_user = True
-    action['wc3_armature_name'] = armatureObject.name
-    action['wc3_sequence_name'] = '#UNANIMATED'
-    add_sequence_to_armature('#UNANIMATED', armatureObject, action.name)
-    for indexNode, node in enumerate(nodes):
-        boneName = bone_names[indexNode]
-        dataPath = 'pose.bones["' + boneName + '"]'
-        locationFcurveX = create_fcurve(action, armatureObject, dataPath + '.location', index=0)
-        locationFcurveY = create_fcurve(action, armatureObject, dataPath + '.location', index=1)
-        locationFcurveZ = create_fcurve(action, armatureObject, dataPath + '.location', index=2)
-        locationFcurveX.keyframe_points.insert(0.0, 0.0)
-        locationFcurveY.keyframe_points.insert(0.0, 0.0)
-        locationFcurveZ.keyframe_points.insert(0.0, 0.0)
-        rotationFcurveX = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=0)
-        rotationFcurveY = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=1)
-        rotationFcurveZ = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=2)
-        rotationFcurveX.keyframe_points.insert(0.0, 0.0)
-        rotationFcurveY.keyframe_points.insert(0.0, 0.0)
-        rotationFcurveZ.keyframe_points.insert(0.0, 0.0)
-        scaleFcurveX = create_fcurve(action, armatureObject, dataPath + '.scale', index=0)
-        scaleFcurveY = create_fcurve(action, armatureObject, dataPath + '.scale', index=1)
-        scaleFcurveZ = create_fcurve(action, armatureObject, dataPath + '.scale', index=2)
-        scaleFcurveX.keyframe_points.insert(0.0, 1.0)
-        scaleFcurveY.keyframe_points.insert(0.0, 1.0)
-        scaleFcurveZ.keyframe_points.insert(0.0, 1.0)
-        
-    for sequence in sequences:
-        intervalStart = sequence.interval_start
-        intervalEnd = sequence.interval_end
-
-        old_act = bpy.data.actions.get(sequence.name)
+    def new_action(name, sequence_name):
+        old_act = bpy.data.actions.get(name)
         if old_act and old_act.users == 0:
             try:
                 bpy.data.actions.remove(old_act)
             except Exception:
                 pass
-
-        action = bpy.data.actions.new(name=sequence.name)
+        action = bpy.data.actions.new(name=name)
         action.use_fake_user = True
         action['wc3_armature_name'] = armatureObject.name
-        action['wc3_sequence_name'] = sequence.name
-        add_sequence_to_armature(sequence.name, armatureObject, action.name)
+        action['wc3_sequence_name'] = sequence_name
+        add_sequence_to_armature(sequence_name, armatureObject, action.name)
+        return action
+
+    # #UNANIMATED only needs to reset nodes that carry animation data; nodes
+    # without any track already sit at their rest pose with no fcurves.
+    action = new_action('#UNANIMATED', '#UNANIMATED')
+    for indexNode, node in enumerate(nodes):
+        if not (node.node.translations or node.node.rotations or node.node.scalings):
+            continue
+        boneName = bone_names[indexNode]
+        dataPath = 'pose.bones["' + boneName + '"]'
+        for i in range(3):
+            fc = create_fcurve(action, armatureObject, dataPath + '.location', index=i)
+            fc.keyframe_points.insert(0.0, 0.0)
+        for i in range(3):
+            fc = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=i)
+            fc.keyframe_points.insert(0.0, 0.0)
+        for i in range(3):
+            fc = create_fcurve(action, armatureObject, dataPath + '.scale', index=i)
+            fc.keyframe_points.insert(0.0, 1.0)
+
+    for sequence in sequences:
+        intervalStart = sequence.interval_start
+        intervalEnd = sequence.interval_end
+        action = new_action(sequence.name, sequence.name)
         for indexNode, node in enumerate(nodes):
-            boneName = bone_names[indexNode]
-            dataPath = 'pose.bones["' + boneName + '"]'
             translations = node.node.translations
             rotations = node.node.rotations
             scalings = node.node.scalings
+            if not (translations or rotations or scalings):
+                continue
+            boneName = bone_names[indexNode]
+            dataPath = 'pose.bones["' + boneName + '"]'
             if translations:
-                locationFcurveX = None
-                locationFcurveY = None
-                locationFcurveZ = None
                 interpolationType = constants.INTERPOLATION_TYPE_NAMES[translations.interpolation_type]
-                for index in range(translations.tracks_count):
-                    time = translations.times[index]
-                    translation = translations.values[index]
-                    if intervalStart <= time and time <= intervalEnd:
-                        if not locationFcurveX:
-                            locationFcurveX = create_fcurve(action, armatureObject, dataPath + '.location', index=0)
-                        if not locationFcurveY:
-                            locationFcurveY = create_fcurve(action, armatureObject, dataPath + '.location', index=1)
-                        if not locationFcurveZ:
-                            locationFcurveZ = create_fcurve(action, armatureObject, dataPath + '.location', index=2)
-                        realTime = round((time - intervalStart) / frameTime, 0)
-                        locationXKeyframe = locationFcurveX.keyframe_points.insert(realTime, translation[0])
-                        locationYKeyframe = locationFcurveY.keyframe_points.insert(realTime, translation[1])
-                        locationZKeyframe = locationFcurveZ.keyframe_points.insert(realTime, translation[2])
-                        locationXKeyframe.interpolation = interpolationType
-                        locationYKeyframe.interpolation = interpolationType
-                        locationZKeyframe.interpolation = interpolationType
-                if not locationFcurveX:
-                    locationFcurveX = create_fcurve(action, armatureObject, dataPath + '.location', index=0)
-                    locationFcurveX.keyframe_points.insert(0.0, 0.0)
-                if not locationFcurveY:
-                    locationFcurveY = create_fcurve(action, armatureObject, dataPath + '.location', index=1)
-                    locationFcurveY.keyframe_points.insert(0.0, 0.0)
-                if not locationFcurveZ:
-                    locationFcurveZ = create_fcurve(action, armatureObject, dataPath + '.location', index=2)
-                    locationFcurveZ.keyframe_points.insert(0.0, 0.0)
+                keys = list(_iter_track_keyframes(translations, intervalStart, intervalEnd, frameTime, global_sequences))
+                if not _create_node_channel(action, armatureObject, dataPath + '.location', 3, keys, interpolationType):
+                    for i in range(3):
+                        fc = create_fcurve(action, armatureObject, dataPath + '.location', index=i)
+                        fc.keyframe_points.insert(0.0, 0.0)
             if rotations:
-                rotationFcurveX = None
-                rotationFcurveY = None
-                rotationFcurveZ = None
                 interpolationType = constants.INTERPOLATION_TYPE_NAMES[rotations.interpolation_type]
-                for index in range(rotations.tracks_count):
-                    time = rotations.times[index]
-                    rotation = rotations.values[index]
-                    if intervalStart <= time and time <= intervalEnd:
-                        if not rotationFcurveX:
-                            rotationFcurveX = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=0)
-                        if not rotationFcurveY:
-                            rotationFcurveY = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=1)
-                        if not rotationFcurveZ:
-                            rotationFcurveZ = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=2)
-                        realTime = round((time - intervalStart) / frameTime, 0)
-                        euler = mathutils.Quaternion(mathutils.Vector(rotation)).to_euler('XYZ')
-                        rotationXKeyframe = rotationFcurveX.keyframe_points.insert(realTime, euler[0])
-                        rotationYKeyframe = rotationFcurveY.keyframe_points.insert(realTime, euler[1])
-                        rotationZKeyframe = rotationFcurveZ.keyframe_points.insert(realTime, euler[2])
-                        rotationXKeyframe.interpolation = interpolationType
-                        rotationYKeyframe.interpolation = interpolationType
-                        rotationZKeyframe.interpolation = interpolationType
-                if not rotationFcurveX:
-                    rotationFcurveX = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=0)
-                    rotationFcurveX.keyframe_points.insert(0.0, 0.0)
-                if not rotationFcurveY:
-                    rotationFcurveY = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=1)
-                    rotationFcurveY.keyframe_points.insert(0.0, 0.0)
-                if not rotationFcurveZ:
-                    rotationFcurveZ = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=2)
-                    rotationFcurveZ.keyframe_points.insert(0.0, 0.0)
+                rotKeys = []
+                for frame, quat in _iter_track_keyframes(rotations, intervalStart, intervalEnd, frameTime, global_sequences):
+                    euler = mathutils.Quaternion(mathutils.Vector(quat)).to_euler('XYZ')
+                    rotKeys.append((frame, (euler[0], euler[1], euler[2])))
+                if not _create_node_channel(action, armatureObject, dataPath + '.rotation_euler', 3, rotKeys, interpolationType):
+                    for i in range(3):
+                        fc = create_fcurve(action, armatureObject, dataPath + '.rotation_euler', index=i)
+                        fc.keyframe_points.insert(0.0, 0.0)
             if scalings:
-                scaleFcurveX = None
-                scaleFcurveY = None
-                scaleFcurveZ = None
                 interpolationType = constants.INTERPOLATION_TYPE_NAMES[scalings.interpolation_type]
-                for index in range(scalings.tracks_count):
-                    time = scalings.times[index]
-                    scale = scalings.values[index]
-                    if intervalStart <= time and time <= intervalEnd:
-                        if not scaleFcurveX:
-                            scaleFcurveX = create_fcurve(action, armatureObject, dataPath + '.scale', index=0)
-                        if not scaleFcurveY:
-                            scaleFcurveY = create_fcurve(action, armatureObject, dataPath + '.scale', index=1)
-                        if not scaleFcurveZ:
-                            scaleFcurveZ = create_fcurve(action, armatureObject, dataPath + '.scale', index=2)
-                        realTime = round((time - intervalStart) / frameTime, 0)
-                        scaleXKeyframe = scaleFcurveX.keyframe_points.insert(realTime, scale[0])
-                        scaleYKeyframe = scaleFcurveY.keyframe_points.insert(realTime, scale[1])
-                        scaleZKeyframe = scaleFcurveZ.keyframe_points.insert(realTime, scale[2])
-                        scaleXKeyframe.interpolation = interpolationType
-                        scaleYKeyframe.interpolation = interpolationType
-                        scaleZKeyframe.interpolation = interpolationType
-                if not scaleFcurveX:
-                    scaleFcurveX = create_fcurve(action, armatureObject, dataPath + '.scale', index=0)
-                    scaleFcurveX.keyframe_points.insert(0.0, 1.0)
-                if not scaleFcurveY:
-                    scaleFcurveY = create_fcurve(action, armatureObject, dataPath + '.scale', index=1)
-                    scaleFcurveY.keyframe_points.insert(0.0, 1.0)
-                if not scaleFcurveZ:
-                    scaleFcurveZ = create_fcurve(action, armatureObject, dataPath + '.scale', index=2)
-                    scaleFcurveZ.keyframe_points.insert(0.0, 1.0)
+                keys = list(_iter_track_keyframes(scalings, intervalStart, intervalEnd, frameTime, global_sequences))
+                if not _create_node_channel(action, armatureObject, dataPath + '.scale', 3, keys, interpolationType):
+                    for i in range(3):
+                        fc = create_fcurve(action, armatureObject, dataPath + '.scale', index=i)
+                        fc.keyframe_points.insert(0.0, 1.0)
+
+
+CAMERA_SENSOR_WIDTH_DEFAULT = 36.0
+
+
+def fov_to_lens(fovRadians):
+    if fovRadians <= 0.001:
+        fovRadians = 0.001
+    return CAMERA_SENSOR_WIDTH_DEFAULT / (2.0 * math.tan(fovRadians / 2.0))
+
+
+def _new_tagged_action(name, sequenceName, armatureName, objectName=None, channel='object'):
+    old_act = bpy.data.actions.get(name)
+    if old_act and old_act.users == 0:
+        try:
+            bpy.data.actions.remove(old_act)
+        except Exception:
+            pass
+    action = bpy.data.actions.new(name=name)
+    action.use_fake_user = True
+    action['wc3_armature_name'] = armatureName
+    action['wc3_sequence_name'] = sequenceName
+    if objectName:
+        action['wc3_object_name'] = objectName
+    action['wc3_channel'] = channel
+    return action
+
+
+def _write_tracked_channel(track, datablock, staticValue, armatureName, objectName, baseName, channel, sequences, frameTime, global_sequences, scalarFn=None):
+    """Create one action per animation sequence for a vec3 or scalar track.
+
+    scalarFn converts raw track values (e.g. FOV radians to lens mm).
+    Returns the '#UNANIMATED' action.
+    """
+    if not sequences:
+        return None
+    value0 = scalarFn(staticValue) if scalarFn else tuple(staticValue)
+    axisCount = len(value0)
+
+    action = _new_tagged_action('#UNANIMATED ' + baseName, '#UNANIMATED', armatureName, objectName, channel)
+    for i in range(axisCount):
+        fc = create_fcurve(action, datablock, channel, index=i)
+        fc.keyframe_points.insert(0.0, value0[i])
+    unanimated = action
+
+    for sequence in sequences:
+        intervalStart = sequence.interval_start
+        intervalEnd = sequence.interval_end
+        action = _new_tagged_action(sequence.name + ' ' + baseName, sequence.name, armatureName, objectName, channel)
+        keys = []
+        interpolationType = 'LINEAR'
+        if track is not None and track.times:
+            interpolationType = constants.INTERPOLATION_TYPE_NAMES.get(track.interpolation_type, 'LINEAR')
+            for frame, value in _iter_track_keyframes(track, intervalStart, intervalEnd, frameTime, global_sequences):
+                keys.append((frame, scalarFn(value) if scalarFn else value))
+        if not keys:
+            keys = [(0, value0)]
+        fcurves = [create_fcurve(action, datablock, channel, index=i) for i in range(axisCount)]
+        for frame, value in keys:
+            for i in range(axisCount):
+                key = fcurves[i].keyframe_points.insert(float(frame), value[i] if i < len(value) else 0.0)
+                key.interpolation = interpolationType
+    return unanimated
+
+
+def create_cameras(model, armatureObject, frameTime):
+    """Import CAMS entries as Blender cameras with an animated target empty."""
+    arm_scale = armatureObject.scale[0] if armatureObject.scale and armatureObject.scale[0] else 0.03
+    for camera in model.cameras:
+        baseName = camera.name or 'Camera'
+        cam_data = bpy.data.cameras.new(baseName)
+        cam_obj = bpy.data.objects.new(baseName, cam_data)
+        cam_obj.parent = armatureObject
+        cam_obj.location = camera.position
+        cam_data.lens = fov_to_lens(camera.field_of_view)
+        cam_data.clip_start = max(camera.near_clipping_plane * arm_scale, 0.001)
+        cam_data.clip_end = max(camera.far_clipping_plane * arm_scale, 0.1)
+        bpy.context.collection.objects.link(cam_obj)
+
+        targetName = baseName + ' Target'
+        target_obj = bpy.data.objects.new(targetName, None)
+        target_obj.empty_display_type = 'PLAIN_AXES'
+        target_obj.parent = armatureObject
+        target_obj.location = camera.target_position
+        bpy.context.collection.objects.link(target_obj)
+
+        constraint = cam_obj.constraints.new(type='TRACK_TO')
+        constraint.target = target_obj
+        constraint.track_axis = 'TRACK_NEGATIVE_Z'
+        constraint.up_axis = 'UP_Y'
+
+        obj_act = _write_tracked_channel(camera.translations, cam_obj, camera.position,
+                                         armatureObject.name, cam_obj.name, cam_obj.name, 'location',
+                                         model.sequences, frameTime, model.global_sequences)
+        if obj_act:
+            cam_obj.animation_data.action = obj_act
+        tgt_act = _write_tracked_channel(camera.target_translations, target_obj, camera.target_position,
+                                         armatureObject.name, target_obj.name, target_obj.name, 'location',
+                                         model.sequences, frameTime, model.global_sequences)
+        if tgt_act:
+            target_obj.animation_data.action = tgt_act
+        # FOV animation lives on the camera datablock as 'lens' (millimetres)
+        lens_act = _write_tracked_channel(camera.fov_track, cam_data, (camera.field_of_view,),
+                                          armatureObject.name, cam_obj.name, cam_obj.name + ' (fov)', 'lens',
+                                          model.sequences, frameTime, model.global_sequences,
+                                          scalarFn=lambda v: (fov_to_lens(v if isinstance(v, float) else v[0]),))
+        if lens_act:
+            cam_data.animation_data.action = lens_act
+
+
+def _light_sequence_actions(light, light_data, armatureName, sequences, frameTime, global_sequences):
+    """One action per sequence carrying both 'energy' and 'color' channels."""
+    def staticEnergy():
+        return (max(light.intensity, 0.0) * 1000.0,)
+    staticColor = tuple(light.color)
+    energyFn = lambda v: (max(v, 0.0) * 1000.0,)
+
+    unanimated = _new_tagged_action('#UNANIMATED ' + light_data.name + ' (light)', '#UNANIMATED', armatureName, light_data.name, 'light')
+    for i in range(1):
+        fc = create_fcurve(unanimated, light_data, 'energy', index=i)
+        fc.keyframe_points.insert(0.0, staticEnergy()[i])
+    for i in range(3):
+        fc = create_fcurve(unanimated, light_data, 'color', index=i)
+        fc.keyframe_points.insert(0.0, staticColor[i])
+
+    for sequence in sequences:
+        intervalStart = sequence.interval_start
+        intervalEnd = sequence.interval_end
+        action = _new_tagged_action(sequence.name + ' ' + light_data.name + ' (light)', sequence.name, armatureName, light_data.name, 'light')
+        energyKeys = []
+        energyInterp = 'LINEAR'
+        if light.intensity_track is not None and light.intensity_track.times:
+            energyInterp = constants.INTERPOLATION_TYPE_NAMES.get(light.intensity_track.interpolation_type, 'LINEAR')
+            for frame, value in _iter_track_keyframes(light.intensity_track, intervalStart, intervalEnd, frameTime, global_sequences):
+                energyKeys.append((frame, energyFn(value)))
+        if not energyKeys:
+            energyKeys = [(0, staticEnergy())]
+        colorKeys = []
+        colorInterp = 'LINEAR'
+        if light.color_track is not None and light.color_track.times:
+            colorInterp = constants.INTERPOLATION_TYPE_NAMES.get(light.color_track.interpolation_type, 'LINEAR')
+            colorKeys = list(_iter_track_keyframes(light.color_track, intervalStart, intervalEnd, frameTime, global_sequences))
+        if not colorKeys:
+            colorKeys = [(0, staticColor)]
+        fcE = create_fcurve(action, light_data, 'energy', index=0)
+        for frame, value in energyKeys:
+            key = fcE.keyframe_points.insert(float(frame), value[0])
+            key.interpolation = energyInterp
+        fcC = [create_fcurve(action, light_data, 'color', index=i) for i in range(3)]
+        for frame, value in colorKeys:
+            for i in range(3):
+                key = fcC[i].keyframe_points.insert(float(frame), value[i] if i < len(value) else 0.0)
+                key.interpolation = colorInterp
+    return unanimated
+
+
+def create_lights(model, armatureObject, bone_names, frameTime):
+    """Import LITE entries as Blender lights parented into the node hierarchy."""
+    arm_scale = armatureObject.scale[0] if armatureObject.scale and armatureObject.scale[0] else 0.03
+    for light in model.lights:
+        baseName = (light.node.name if light.node and light.node.name else 'Light')
+        light_data = bpy.data.lights.new(baseName, 'POINT')
+        if light.light_type == 1:
+            light_data.type = 'SUN'
+        light_data.color = light.color
+        light_data.energy = max(light.intensity, 0.0) * 1000.0
+        if light.attenuation[1] > 0 and hasattr(light_data, 'custom_distance'):
+            try:
+                light_data.use_custom_distance = True
+                light_data.custom_distance = max(light.attenuation[1] * arm_scale, 0.01)
+            except Exception:
+                pass
+        light_obj = bpy.data.objects.new(baseName, light_data)
+        parentId = light.node.parent if light.node else None
+        if parentId is not None and 0 <= parentId < len(bone_names):
+            light_obj.parent = armatureObject
+            light_obj.parent_type = 'BONE'
+            light_obj.parent_bone = bone_names[parentId]
+            light_obj.location = (0.0, 0.0, 0.0)
+        else:
+            light_obj.parent = armatureObject
+            nodeId = light.node.id if light.node and light.node.id is not None else 0
+            if 0 <= nodeId < len(model.pivot_points):
+                light_obj.location = model.pivot_points[nodeId]
+        bpy.context.collection.objects.link(light_obj)
+
+        light_act = _light_sequence_actions(light, light_data, armatureObject.name,
+                                            model.sequences, frameTime, model.global_sequences)
+        if light_act:
+            light_data.animation_data.action = light_act
 
 
 def create_object_actions(model, bpyObjects, frameTime, armatureObject=None):
