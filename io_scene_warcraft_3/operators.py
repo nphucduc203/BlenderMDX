@@ -282,11 +282,28 @@ def _flatten_wc3_material(src):
     tex = fn.new('ShaderNodeTexImage')
     tex.image = img
     fl.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
-    fl.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
+    if additive:
+        # Additive WC3 surfaces never occlude: bright texels add light,
+        # dark ones stay invisible. glTF has no additive blending, so
+        # approximate it with alpha = luminance(color) * texture alpha.
+        # A plain BLEND with the texture's alpha would turn dark glow
+        # textures (e.g. splash quads) into opaque black plates.
+        bw = fn.new('ShaderNodeRGBToBW')
+        mul = fn.new('ShaderNodeMath')
+        mul.operation = 'MULTIPLY'
+        mul.use_clamp = True
+        fl.new(tex.outputs['Color'], bw.inputs['Color'])
+        fl.new(bw.outputs['Val'], mul.inputs[0])
+        fl.new(tex.outputs['Alpha'], mul.inputs[1])
+        fl.new(mul.outputs['Value'], bsdf.inputs['Alpha'])
+    else:
+        fl.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
     if unshaded or additive:
-        # glTF has emissiveTexture; preserves glows without scene lighting
+        # glTF has emissiveTexture; preserves glows without scene lighting.
+        # The flat base color is already diffuse-lit, so full-strength
+        # emission double-brightens; 0.3 measured closest to the WC3 look.
         fl.new(tex.outputs['Color'], bsdf.inputs['Emission Color'])
-        bsdf.inputs['Emission Strength'].default_value = 1.0
+        bsdf.inputs['Emission Strength'].default_value = 0.3
     fl.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
     flat.use_backface_culling = src.use_backface_culling
     if hasattr(flat, 'surface_render_method') and hasattr(src, 'surface_render_method'):

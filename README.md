@@ -102,6 +102,11 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 
 ## 📋 Changelog
 
+### v1.4.2
+- **Fixed the "black plate" GLB bug**: additive WC3 materials (glows, splashes, ribbons) never occlude in-game, but the flattened export material used the texture's alpha channel with `BLEND` — dark additive textures (e.g. splash quads) re-imported as giant opaque black plates covering the model. Additive materials now export with `alpha = luminance(color) × texture alpha`, so bright texels glow and dark texels stay invisible, matching WC3.
+- **Balanced glow brightness**: the flat material combined diffuse lighting with full-strength emission, double-brightening everything. Emission strength is now 0.3, measured closest to the original WC3 render (pixel-diff improved ~43%).
+- Round-trip verified on `2 (95).mdx` (Moon Priestess): black pixels 32.5% → 0%, color parity restored, 12 sequences + camera intact.
+
 ### v1.4.1
 - **Godot GLB export rewritten**: exports only the model (armature + meshes + camera/lights) instead of the whole scene, so Blender-side particle preview helpers (`W3_Inst_*` quads at −1000, `W3_Emitter_*`) and unrelated scene objects no longer leak into the GLB.
 - **Textures survive glTF export**: WC3 materials use ObjectInfo tints and Add-Shader emission that the glTF exporter cannot translate (re-imported models rendered black/untextured). Export now temporarily swaps in flat `texture → Base Color / Alpha / Emission` materials and restores your originals afterwards.
@@ -224,6 +229,7 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 
 ## 📋 Lịch sử thay đổi (Tóm tắt)
 
+- **v1.4.2** — Sửa lỗi "tấm đen khổng lồ" khi mở GLB: material additive (glow/splash/ribbon) trước đây bị xuất thành mặt đen đặc che cả model; giờ alpha = độ sáng texture (sáng thì glow, tối thì trong suốt) đúng như WC3. Giảm độ sáng emission (0.3) hết hiện tượng chói/loang trắng. Kiểm chứng: hết 32.5% pixel đen, màu khớp bản gốc.
 - **v1.4.1** — Viết lại xuất GLB cho Godot: chỉ xuất đúng model (loại object preview hạt `W3_*`), làm phẳng material WC3 để texture không bị mất khi xuất (hết lỗi mesh đen), xuất kèm camera. Đã kiểm thử vòng khép kín: đủ 12 sequence, camera, material giữ đủ texture.
 - **v1.4.0** — Hỗ trợ MDX Reforged (VERS 1000); import camera (`CAMS`) và đèn (`LITE`); áp dụng global sequence (GLBS); lưu KATV/KEVT; sửa crash Blender 5.x khi import normal (test 148 model liên tục không crash); dọn action an toàn; tăng cường xử lý parser.
 - **v1.3.0** — Texture additive nhiều lớp; hệ ParticleEmitter2 chính xác; nút điều khiển particle trong sidebar; sửa lỗi animation giữa các file.
