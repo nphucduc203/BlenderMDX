@@ -59,11 +59,12 @@ class WARCRAFT3_PT_viewport(bpy.types.Panel):
         row_p.operator('warcraft_3.convert_particle_emitters', text='Convert Particles', icon='FILE_REFRESH')
         row_p.operator('warcraft_3.toggle_particles', text='Show/Hide Particles', icon='HIDE_OFF')
 
-        # Godot Engine Tools
+        # Game Engine Export Tools
         layout.separator()
         box_godot = layout.box()
-        box_godot.label(text='Godot Engine Export:', icon='EXPORT')
-        box_godot.operator('warcraft_3.export_godot_glb', text='Export for Godot (.glb)', icon='FILE_3D')
+        box_godot.label(text='Export Model (.glb):', icon='EXPORT')
+        box_godot.operator('warcraft_3.export_lossless_glb', text='Export Lossless GLB + WC3 Extensions', icon='SHADERFX')
+        box_godot.operator('warcraft_3.export_compatible_glb', text='Export Compatible GLB (Standard PBR)', icon='FILE_3D')
         box_godot.operator('warcraft_3.push_to_nla', text='Push All to NLA Tracks', icon='NLA')
 
         layout.separator()
@@ -111,8 +112,11 @@ class WARCRAFT3_PT_armature(bpy.types.Panel):
         col.operator('warcraft_3.remove_sequence_to_armature', icon='REMOVE', text='')
 
         layout.separator()
-        layout.operator('warcraft_3.export_godot_glb', text='Export for Godot (.glb)', icon='FILE_3D')
-        layout.operator('warcraft_3.push_to_nla', icon='NLA', text='Push All to NLA Tracks')
+        box_godot = layout.box()
+        box_godot.label(text='Export Model (.glb):', icon='EXPORT')
+        box_godot.operator('warcraft_3.export_lossless_glb', text='Export Lossless GLB + WC3 Extensions', icon='SHADERFX')
+        box_godot.operator('warcraft_3.export_compatible_glb', text='Export Compatible GLB (Standard PBR)', icon='FILE_3D')
+        box_godot.operator('warcraft_3.push_to_nla', icon='NLA', text='Push All to NLA Tracks')
 
 
 class WARCRAFT3_PT_bone(bpy.types.Panel):

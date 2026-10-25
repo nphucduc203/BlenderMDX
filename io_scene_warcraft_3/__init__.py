@@ -1,7 +1,7 @@
 bl_info = {
     'name': 'WarCraft 3 .mdx Importer & Game Engine .glb Exporter',
     'author': 'nphucduc203, Torenjk, Pavel_Blend, Nekuromu',
-    'version': (1, 5, 5),
+    'version': (1, 6, 0),
     'blender': (4, 2, 0),
     'category': 'Import-Export',
     'location': 'File > Import / Export',

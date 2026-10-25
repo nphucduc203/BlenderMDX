@@ -91,16 +91,24 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 3. Switch to the **WarCraft 3** tab.
 4. Click any sequence in the **Animation Sequences** list to play!
 
-### Exporting to Godot (.glb)
-1. In the **WarCraft 3** sidebar tab, click **Export for Godot (.glb)**.
-2. Pick the output path — done. The file contains the model, embedded textures, camera, and every animation sequence as a separate clip.
-3. **Previewing the GLB in Blender**: Blender's glTF importer draws each bone as a stretched octahedron with an Icosphere custom shape. This is a *display artifact of the importer* — the shapes are not in the file and Godot does not show them. Press **Fix glTF Display (Hide Spheres)** in the WarCraft 3 tab to clean the viewport.
+### Exporting to Game Engines (.glb)
+1. In the **WarCraft 3** sidebar tab, choose your export mode:
+   - **Export Lossless GLB (WC3 Extensions)**: Industry-standard 2-tier architecture. 1 geoset splits into N glTF primitives for all multi-layer materials (e.g. skin + glow + star shimmer). Preserves exact layerAlpha and additive metadata in `extras` for Godot, Unity, Unreal with custom shaders. Zero black plates, 100% layer fidelity.
+   - **Export Compatible GLB (Standard PBR)**: Standard glTF PBR for universal 3D viewers (Windows 3D Viewer, web). Uses frozen approximation formulas (`layerAlpha²` + boosted emission).
+2. **Previewing the GLB in Blender**: Blender's glTF importer draws each bone as a stretched octahedron with an Icosphere custom shape. This is a *display artifact of the importer* — the shapes are not in the file and Godot does not show them. Press **Fix glTF Display (Hide Spheres)** in the WarCraft 3 tab to clean the viewport.
 
 > **Note**: `.mdl` (text format) is not supported — convert to `.mdx` with Retera Model Studio first.
 
 ---
 
 ## 📋 Changelog
+
+### v1.6.0
+- **Industry-Standard 2-Tier Architecture**:
+  - **Export Lossless GLB + WC3 Extensions**: 1 geoset with N layers exports as N primitives in a single glTF mesh! Preserves exact `layerAlpha`, color tints, and `BLEND_MODE_ADD` metadata in `extras` without fake alpha or luminance gating. Includes 17 bone-attached particle emitter markers.
+  - **Export Compatible GLB (Standard PBR)**: Preserves the frozen PBR approximation (`layerAlpha²` + boosted emission) for universal viewers without custom shaders.
+  - **Dual Export UI**: Two distinct buttons in the sidebar, properties panel, and File > Export menu.
+  - **Godot 4 Multi-Surface Post-Import**: Automatically restores true additive blending on all multi-primitive surfaces and spawns `GPUParticles3D` on bones.
 
 ### v1.5.5
 - **Direct GLB Binary Post-Processor (`postprocess_wc3_glb`)**:
@@ -236,10 +244,11 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 3. Chuyển sang tab **WarCraft 3**.
 4. Bấm vào bất kỳ sequence trong danh sách **Animation Sequences** để phát!
 
-### Xuất sang Godot (.glb)
-1. Trong tab sidebar **WarCraft 3**, bấm **Export for Godot (.glb)**.
-2. Chọn đường dẫn lưu — xong. File chứa model, texture nhúng, camera và mọi sequence animation thành từng clip riêng.
-3. **Xem trước GLB bằng Blender**: glTF importer của Blender vẽ mỗi bone thành khung bát diện giãn dài kèm hình Icosphere. Đây là *artifact hiển thị của importer* — các hình này không nằm trong file và Godot không hiển thị chúng. Bấm **Fix glTF Display (Hide Spheres)** trong tab WarCraft 3 để dọn sạch viewport.
+### Xuất sang Game Engine (.glb)
+1. Trong tab sidebar **WarCraft 3**, chọn chế độ xuất:
+   - **Export Lossless GLB (WC3 Extensions)**: Kiến trúc 2 tầng chuẩn công nghiệp. 1 geoset có N layer được xuất thành N primitive trong cùng 1 mesh glTF (ví dụ skin + glow + star shimmer). Giữ nguyên layerAlpha và metadata additive trong `extras` cho Godot, Unity, Unreal kèm custom shader. Không tấm đen, giữ nguyên 100% layer.
+   - **Export Compatible GLB (Standard PBR)**: Định dạng glTF PBR chuẩn cho các trình xem 3D phổ thông (Windows 3D Viewer, web). Sử dụng công thức xấp xỉ cố định (`layerAlpha²` + emission tăng cường).
+2. **Xem trước GLB bằng Blender**: glTF importer của Blender vẽ mỗi bone thành khung bát diện giãn dài kèm hình Icosphere. Đây là *artifact hiển thị của importer* — các hình này không nằm trong file và Godot không hiển thị chúng. Bấm **Fix glTF Display (Hide Spheres)** trong tab WarCraft 3 để dọn sạch viewport.
 
 > **Lưu ý**: định dạng `.mdl` (văn bản) không được hỗ trợ — hãy chuyển sang `.mdx` bằng Retera Model Studio trước.
 
@@ -247,6 +256,11 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 
 ## 📋 Lịch sử thay đổi (Tóm tắt)
 
+- **v1.6.0** — Kiến trúc 2 tầng (2-Tier Architecture) chuẩn công nghiệp:
+  - **Export Lossless GLB + WC3 Extensions**: 1 geoset nhiều layer xuất thành N primitive trong 1 mesh glTF! Giữ nguyên `layerAlpha` gốc (không fake alpha, không bình phương), nhúng siêu dữ liệu `extras` cho game engine. Kèm 17 emitter marker trên xương.
+  - **Export Compatible GLB (Standard PBR)**: Giữ nguyên công thức xấp xỉ PBR tĩnh (`layerAlpha²` + emission 0.3/boosted) chạy độc lập trên mọi trình xem 3D.
+  - **Giao diện 2 nút xuất rõ ràng**: Cung cấp 2 lựa chọn xuất riêng biệt trên Sidebar, Properties panel và menu File > Export.
+  - **Hỗ trợ Multi-Surface trong Godot 4**: Script `wc3_post_import.gd` tự động kích hoạt `BLEND_MODE_ADD` trên từng surface và sinh hạt `GPUParticles3D`.
 - **v1.5.5** — Bộ xử lý nhị phân GLB trực tiếp (`postprocess_wc3_glb`):
   - Tự động phân tích và ghi đè trực tiếp các thuộc tính glTF 2.0 vào binary của file `.glb` (`alphaMode`, `alphaCutoff`, `doubleSided`, `emissiveFactor`, `KHR_materials_emissive_strength`) dựa trên metadata `extras`.
   - Đảm bảo file `.glb` chuẩn cấu trúc căn hàng 4-byte cho Godot, Unity, Unreal Engine và WebGL.

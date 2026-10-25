@@ -9,8 +9,12 @@ def menu_import_mdx(self, context):
     self.layout.operator(operators.WarCraft3OperatorImportMDX.bl_idname, text='WarCraft 3 (.mdx)')
 
 
-def menu_export_godot(self, context):
-    self.layout.operator(operators.WarCraft3OperatorExportGodotGLB.bl_idname, text='WarCraft 3 for Godot (.glb)')
+def menu_export_lossless(self, context):
+    self.layout.operator(operators.WarCraft3OperatorExportLosslessGLB.bl_idname, text='WarCraft 3 Lossless GLB + Extensions (.glb)')
+
+
+def menu_export_compatible(self, context):
+    self.layout.operator(operators.WarCraft3OperatorExportCompatibleGLB.bl_idname, text='WarCraft 3 Compatible GLB (Standard PBR) (.glb)')
 
 
 def register_class_safe(cls):
@@ -26,8 +30,11 @@ def register():
     register_class_safe(operators.WarCraft3OperatorImportMDX)
     bpy.types.TOPBAR_MT_file_import.append(menu_import_mdx)
     
+    register_class_safe(operators.WarCraft3OperatorExportLosslessGLB)
+    register_class_safe(operators.WarCraft3OperatorExportCompatibleGLB)
     register_class_safe(operators.WarCraft3OperatorExportGodotGLB)
-    bpy.types.TOPBAR_MT_file_export.append(menu_export_godot)
+    bpy.types.TOPBAR_MT_file_export.append(menu_export_lossless)
+    bpy.types.TOPBAR_MT_file_export.append(menu_export_compatible)
     
     register_class_safe(operators.WarCraft3OperatorCleanBoneShapes)
     register_class_safe(operators.WarCraft3OperatorAddSequenceToArmature)
@@ -54,7 +61,11 @@ def unregister():
     except Exception:
         pass
     try:
-        bpy.types.TOPBAR_MT_file_export.remove(menu_export_godot)
+        bpy.types.TOPBAR_MT_file_export.remove(menu_export_lossless)
+    except Exception:
+        pass
+    try:
+        bpy.types.TOPBAR_MT_file_export.remove(menu_export_compatible)
     except Exception:
         pass
     for cls in (
@@ -78,6 +89,8 @@ def unregister():
         types.WarCraft3ArmatureProperties,
         types.WarCraft3ArmatureSequenceList,
         operators.WarCraft3OperatorCleanBoneShapes,
+        operators.WarCraft3OperatorExportLosslessGLB,
+        operators.WarCraft3OperatorExportCompatibleGLB,
         operators.WarCraft3OperatorExportGodotGLB,
         operators.WarCraft3OperatorPushToNLA,
         operators.WarCraft3OperatorConvertParticles,

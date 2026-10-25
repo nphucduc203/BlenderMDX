@@ -63,8 +63,10 @@ func _process_mesh_materials(node: Node) -> void:
 
 		if mat is StandardMaterial3D or mat is ORMMaterial3D:
 			var mat_extras = _get_extras(mat)
-			var is_additive = node_is_additive or (mat_extras.get("wc3_blend") == "additive")
+			var filter_mode = int(mat_extras.get("wc3_filter_mode", -1))
+			var is_additive = node_is_additive or (mat_extras.get("wc3_blend") == "additive") or (filter_mode in [3, 4])
 			var is_unshaded = is_additive or (mat_extras.get("wc3_unshaded") == true) or (mat_extras.get("wc3_blend") == "unshaded")
+			var layer_alpha = float(mat_extras.get("wc3_layer_alpha", 1.0))
 
 			if is_additive:
 				# True WarCraft 3 Additive Blending:
@@ -74,16 +76,22 @@ func _process_mesh_materials(node: Node) -> void:
 				mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 				mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 
-				# Apply WC3 layer tint if embedded
+				# Apply WC3 layer tint and exact layer alpha
 				var tint = mat_extras.get("wc3_tint")
 				if tint is Array and tint.size() >= 3:
-					var a = float(tint[3]) if tint.size() > 3 else 1.0
-					mat.albedo_color = Color(float(tint[0]), float(tint[1]), float(tint[2]), a)
+					mat.albedo_color = Color(float(tint[0]), float(tint[1]), float(tint[2]), layer_alpha)
+				else:
+					mat.albedo_color = Color(1.0, 1.0, 1.0, layer_alpha)
 
-				# In additive mode, emission should be pure white multiplier
+				# In additive mode, emission multiplies radiant glow
 				if mat.emission_enabled:
 					mat.emission = Color(1.0, 1.0, 1.0)
 					mat.emission_energy_multiplier = 1.0
+			elif filter_mode == 1:
+				mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+				mat.alpha_scissor_threshold = 0.5
+				if is_unshaded:
+					mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 			elif is_unshaded:
 				mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 				mat.cull_mode = BaseMaterial3D.CULL_DISABLED
