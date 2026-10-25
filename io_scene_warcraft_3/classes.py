@@ -21,14 +21,16 @@ class WarCraft3Model:
         self.lights = []
 
     def normalize_meshes_names(self):
-        for mesh in self.meshes:
-            mesh.name = self.name
+        for idx, mesh in enumerate(self.meshes):
+            mesh.name = f"{self.name}_Geoset_{idx}" if self.name else f"Geoset_{idx}"
+
 
 class WarCraft3Bone:
     def __init__(self):
         self.type = 'bone'
         self.node = None
         self.geoset_id = None
+        self.geoset_animation_id = None
 
 
 class WarCraft3Helper:
@@ -96,6 +98,8 @@ class WarCraft3ParticleEmitter2:
         self.squirt = 0
         self.priority_plane = 0
         self.replaceable_id = 0
+        self.visibility_track = None
+        self.emission_rate_track = None
 
 
 class WarCraft3RibbonEmitter:
@@ -160,6 +164,7 @@ class WarCraft3Node:
         self.name = None
         self.id = None
         self.parent = None
+        self.flags = 0
         self.translations = None
         self.rotations = None
         self.scalings = None
@@ -181,7 +186,10 @@ class WarCraft3Mesh:
         self.normals = []
         self.triangles = []
         self.uvs = []
+        self.uv_sets = []
         self.material_id = None
+        self.selection_group = 0
+        self.selection_flags = 0
         self.vertex_groups = []
         self.vertex_groups_ids = None
 
@@ -200,6 +208,8 @@ class WarCraft3Layer:
 
 class WarCraft3Material:
     def __init__(self):
+        self.priority_plane = 0
+        self.flags = 0
         self.layers = []
 
 
@@ -207,6 +217,7 @@ class WarCraft3Texture:
     def __init__(self):
         self.image_file_name = None
         self.replaceable_id = None
+        self.flags = 0
 
 
 class WarCraft3Sequence:
@@ -214,6 +225,7 @@ class WarCraft3Sequence:
         self.name = None
         self.interval_start = None
         self.interval_end = None
+        self.flags = 0
 
 
 class WarCraft3GeosetAnimation:
@@ -232,6 +244,7 @@ class MDXImportProperties:
         self.texture_search_dir = ''
         self.auto_import_textures = True
         self.team_color = None
+        self.set_team_color = 'RED'
         self.bone_size = 1.0
         self.use_custom_fps = False
         self.fps = 30
@@ -242,14 +255,13 @@ class MDXImportProperties:
     def calculate_frame_time(self):
         if not self.use_custom_fps:
             self.fps = bpy.context.scene.render.fps
-        
-        # Ensure self.fps is a float or int, not a Blender property
+
         try:
             fps_val = float(self.fps)
         except TypeError:
-            fps_val = 30.0 # Default fallback
-            
+            fps_val = 30.0
+
         if fps_val <= 0:
             fps_val = 30.0
-            
+
         self.frame_time = 1000.0 / fps_val

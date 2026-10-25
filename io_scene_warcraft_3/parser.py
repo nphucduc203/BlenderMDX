@@ -1,4 +1,3 @@
-
 import bpy
 import os
 from . import classes
@@ -22,6 +21,7 @@ def parse_material_alpha(r):
     alpha.tracks_count = r.getf('<I')[0]
     alpha.interpolation_type = r.getf('<I')[0]
     globalSequenceId = r.getf('<I')[0]
+    alpha.global_sequence_id = globalSequenceId if globalSequenceId != 0xffffffff else None
     for _ in range(alpha.tracks_count):
         time = r.getf('<I')[0]
         value = r.getf('<f')[0]    # alpha value
@@ -38,14 +38,16 @@ def parse_material_texture_id(r):
     textureId.tracks_count = r.getf('<I')[0]
     textureId.interpolation_type = r.getf('<I')[0]
     globalSequenceId = r.getf('<I')[0]
+    textureId.global_sequence_id = globalSequenceId if globalSequenceId != 0xffffffff else None
     for _ in range(textureId.tracks_count):
         time = r.getf('<I')[0]
-        value = r.getf('<f')[0]    # texture id value
+        value = r.getf('<I')[0]    # texture id integer value
         textureId.times.append(time)
         textureId.values.append(value)
         if textureId.interpolation_type > constants.INTERPOLATION_TYPE_LINEAR:
-            inTan = r.getf('<f')[0]
-            outTan = r.getf('<f')[0]
+            inTan = r.getf('<I')[0]
+            outTan = r.getf('<I')[0]
+    return textureId
 
 
 def parse_track_float(r):
@@ -102,8 +104,10 @@ def parse_materials(data, model):
     while r.offset < dataSize:
         material = classes.WarCraft3Material()
         inclusiveSize = r.getf('<I')[0]
-        priorityPlane = r.getf('<I')[0]
+        priorityPlane = r.getf('<i')[0]
         flags = r.getf('<I')[0]
+        material.priority_plane = priorityPlane
+        material.flags = flags
         layerChunkDataSize = inclusiveSize - 12
         if layerChunkDataSize > 0:
             layerChunkData = data[r.offset : r.offset + layerChunkDataSize]
@@ -122,7 +126,7 @@ def parse_textures(data, model):
         texture = classes.WarCraft3Texture()
         texture.replaceable_id = r.getf('<I')[0]
         texture.image_file_name = r.gets(260)
-        flags = r.getf('<I')[0]
+        texture.flags = r.getf('<I')[0]
         model.textures.append(texture)
 
 
@@ -186,7 +190,7 @@ def parse_node(r):
     node.parent = r.getf('<I')[0]
     if node.parent == 0xffffffff:
         node.parent = None
-    flags = r.getf('<I')[0]
+    node.flags = r.getf('<I')[0]
     while r.offset < inclusiveSize:
         chunkId = r.getid()
         if chunkId == constants.CHUNK_GEOSET_TRANSLATION:
@@ -209,8 +213,10 @@ def parse_bones(data, model):
     while r.offset < dataSize:
         bone = classes.WarCraft3Bone()
         bone.node = parse_node(r)
-        bone.geoset_id = r.getf('<I')[0]
+        geosetId = r.getf('<I')[0]
         geosetAnimationId = r.getf('<I')[0]
+        bone.geoset_id = geosetId if geosetId != 0xffffffff else None
+        bone.geoset_animation_id = geosetAnimationId if geosetAnimationId != 0xffffffff else None
         model.nodes.append(bone)
 
 
@@ -223,7 +229,10 @@ def get_vertex_groups(matrixGroups, matrixGroupsSizes, matrixIndices):
     vertexGroups = []
     vertexGroupsIds = set()
     for matrixGroup in matrixGroups:
-        vertexGroup = matrix[matrixGroup]
+        if matrixGroup < len(matrix):
+            vertexGroup = matrix[matrixGroup]
+        else:
+            vertexGroup = []
         vertexGroups.append(vertexGroup)
         for vertexGroupId in vertexGroup:
             vertexGroupsIds.add(vertexGroupId)
@@ -243,22 +252,16 @@ def parse_geometry(data):
         vertexPositionX, vertexPositionY, vertexPositionZ = r.getf('<3f')
         mesh.vertices.append((vertexPositionX, vertexPositionY, vertexPositionZ))
     ############################################################################
-    ################################# NOT USED #################################
-    ############################################################################
     chunkId = r.getid(constants.CHUNK_VERTEX_NORMAL)
     normalsCount = r.getf('<I')[0]
     for _ in range(normalsCount):
         normal = r.getf('<3f')
         mesh.normals.append(normal)
     ############################################################################
-    ################################# NOT USED #################################
-    ############################################################################
     chunkId = r.getid(constants.CHUNK_FACE_TYPE_GROUP)
     faceTypeGroupsCount = r.getf('<I')[0]
     for _ in range(faceTypeGroupsCount):
         faceType = r.getf('<I')[0]
-    ############################################################################
-    ################################# NOT USED #################################
     ############################################################################
     chunkId = r.getid(constants.CHUNK_FACE_GROUP)
     faceGroupCount = r.getf('<I')[0]
@@ -300,6 +303,8 @@ def parse_geometry(data):
     mesh.material_id = r.getf('<I')[0]
     selectionGroup = r.getf('<I')[0]
     selectionFlags = r.getf('<I')[0]
+    mesh.selection_group = selectionGroup
+    mesh.selection_flags = selectionFlags
     boundsRadius = r.getf('<f')[0]
     minimumExtent = r.getf('<3f')
     maximumExtent = r.getf('<3f')
@@ -309,16 +314,29 @@ def parse_geometry(data):
         minimumExtent = r.getf('<3f')
         maximumExtent = r.getf('<3f')
     ############################################################################
-    ################################# NOT USED #################################
-    ############################################################################
     chunkId = r.getid(constants.CHUNK_TEXTURE_VERTEX_GROUP)
     textureVertexGroupCount = r.getf('<I')[0]
-    ############################################################################
-    chunkId = r.getid(constants.CHUNK_VERTEX_TEXTURE_POSITION)
-    vertexTexturePositionCount = r.getf('<I')[0]
-    for _ in range(vertexTexturePositionCount):
-        u, v = r.getf('<2f')
-        mesh.uvs.append((u, 1 - v))
+    num_uv_sets = max(textureVertexGroupCount, 1)
+    for uv_set_idx in range(num_uv_sets):
+        if r.offset + 8 > len(data):
+            break
+        try:
+            subId = r.getid(constants.CHUNK_VERTEX_TEXTURE_POSITION, debug=True)
+            if subId != constants.CHUNK_VERTEX_TEXTURE_POSITION:
+                r.offset -= 4
+                break
+            vertexTexturePositionCount = r.getf('<I')[0]
+            uv_list = []
+            for _ in range(vertexTexturePositionCount):
+                u, v = r.getf('<2f')
+                uv_list.append((u, 1.0 - v))
+            mesh.uv_sets.append(uv_list)
+            if uv_set_idx == 0:
+                mesh.uvs = uv_list
+        except Exception:
+            break
+    if not mesh.uvs and mesh.uv_sets:
+        mesh.uvs = mesh.uv_sets[0]
     ############################################################################
     return mesh
 
@@ -427,10 +445,10 @@ def parse_collision_shapes(data, model):
         elif type == 2:
             verticesCount = 1
         else:
-            raise Exception('UNSUPPORTED COLLISION SHAPE TYPE:', type)
+            verticesCount = 2
         for _ in range(verticesCount):
             position = r.getf('<3f')
-        if type == 2:
+        if type in (2, 3):
             boundsRadius = r.getf('<f')[0]
         model.nodes.append(collisionShape)
 
@@ -448,6 +466,7 @@ def parse_sequences(data, model):
         sequence.interval_end = r.getf('<I')[0]
         moveSpeed = r.getf('<f')[0]
         flags = r.getf('<I')[0]
+        sequence.flags = flags
         rarity = r.getf('<f')[0]
         syncPoint = r.getf('<I')[0]
         boundsRadius = r.getf('<f')[0]
@@ -461,10 +480,11 @@ def parse_geoset_color(r):
     color.tracks_count = r.getf('<I')[0]
     color.interpolation_type = r.getf('<I')[0]
     globalSequenceId = r.getf('<I')[0]
+    color.global_sequence_id = globalSequenceId if globalSequenceId != 0xffffffff else None
     for _ in range(color.tracks_count):
         time = r.getf('<I')[0]
         bgr = r.getf('<3f')    # MDX geoset color value is BGR
-        rgb = (bgr[2], bgr[1], bgr[0]) # Convert BGR -> RGB
+        rgb = (bgr[2], bgr[1], bgr[0])  # Convert BGR -> RGB
         color.times.append(time)
         color.values.append(rgb)
         if color.interpolation_type > constants.INTERPOLATION_TYPE_LINEAR:
@@ -478,6 +498,7 @@ def parse_geoset_alpha(r):
     alpha.tracks_count = r.getf('<I')[0]
     alpha.interpolation_type = r.getf('<I')[0]
     globalSequenceId = r.getf('<I')[0]
+    alpha.global_sequence_id = globalSequenceId if globalSequenceId != 0xffffffff else None
     for _ in range(alpha.tracks_count):
         time = r.getf('<I')[0]
         value = r.getf('<f')[0]    # alpha value
@@ -498,7 +519,7 @@ def parse_geoset_animations(data, model):
         alpha = r.getf('<f')[0]
         flags = r.getf('<I')[0]
         bgr = r.getf('<3f')
-        rgb = (bgr[2], bgr[1], bgr[0]) # MDX geoset color is BGR -> RGB
+        rgb = (bgr[2], bgr[1], bgr[0])  # MDX geoset color is BGR -> RGB
         geosetAnimation.geoset_id = r.getf('<I')[0]
         geosetAnimation.alpha = alpha
         geosetAnimation.flags = flags
@@ -689,6 +710,17 @@ def parse_particle_emitters_2(data, model):
         emitter.squirt = r.getf('<I')[0]
         emitter.priority_plane = r.getf('<i')[0]
         emitter.replaceable_id = r.getf('<I')[0]
+        while r.offset + 4 <= inclusiveSize:
+            chunkId = r.getid()
+            if chunkId == 'KP2V':
+                emitter.visibility_track = parse_track_float(r)
+            elif chunkId == 'KP2E':
+                emitter.emission_rate_track = parse_track_float(r)
+            elif chunkId in ('KP2S', 'KP2R', 'KP2L', 'KP2G', 'KP2W', 'KP2N'):
+                _ = parse_track_float(r)
+            else:
+                r.offset -= 4
+                break
         if r.offset < inclusiveSize:
             r.skip(inclusiveSize - r.offset)
         elif r.offset > inclusiveSize:
@@ -728,8 +760,6 @@ def parse_version(data, model):
     version = r.getf('<I')[0]
     model.version = version
     if version not in constants.MDX_SUPPORTED_VERSIONS:
-        # Reforged (1000) and newer tools may write other values while keeping the
-        # classic layout; warn and continue instead of aborting the whole import.
         print('[WarCraft 3] Warning: unusual MDX format version {0}; '
               'attempting to load it anyway.'.format(version))
 
@@ -794,7 +824,6 @@ def load_mdx(importProperties):
             '"{0}" is a .mdl (text format) file. This addon imports the binary '
             '.mdx format only - convert the model to .mdx with Retera Model '
             'Studio (File > Save As) and try again.'.format(os.path.basename(mdxPath)))
-    mdxFile = open(mdxPath, 'rb')
-    mdxFileData = mdxFile.read()
-    mdxFile.close()
+    with open(mdxPath, 'rb') as mdxFile:
+        mdxFileData = mdxFile.read()
     return parse_mdx(mdxFileData, importProperties)

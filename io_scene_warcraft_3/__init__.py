@@ -1,15 +1,48 @@
-
 bl_info = {
-    'name': 'WarCraft 3 .mdx importer',
+    'name': 'WarCraft 3 .mdx Importer & Game Engine .glb Exporter',
     'author': 'nphucduc203, Torenjk, Pavel_Blend, Nekuromu',
-    'version': (1, 4, 4),
+    'version': (1, 5, 5),
     'blender': (4, 2, 0),
     'category': 'Import-Export',
-    'location': 'File > Import',
-    'description': 'Import *.mdx files (3d models of WarCraft 3)',
+    'location': 'File > Import / Export',
+    'description': 'Import WarCraft 3 *.mdx models and export full multi-layer *.glb for Godot, Unity, Unreal & Blender 5.2',
     'wiki_url': 'https://github.com/nphucduc203/BlenderMDX',
     'tracker_url': 'https://github.com/nphucduc203/BlenderMDX/issues'
 }
 
+import importlib
+from . import (
+    constants,
+    classes,
+    binary,
+    blp,
+    utils,
+    types,
+    preferences,
+    importer,
+    parser,
+    operators,
+    ui,
+    plugin,
+)
+
+for _mod in (
+    constants,
+    classes,
+    binary,
+    blp,
+    utils,
+    types,
+    preferences,
+    importer,
+    parser,
+    operators,
+    ui,
+    plugin,
+):
+    try:
+        importlib.reload(_mod)
+    except Exception:
+        pass
 
 from .plugin import register, unregister

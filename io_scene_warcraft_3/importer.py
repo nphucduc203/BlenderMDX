@@ -11,8 +11,17 @@ from . import blp
 # Session cache for indexed textures
 _TEXTURE_INDEX_CACHE = {}
 
-
 WC3_EMITTERS_CACHE = {}
+
+FILTER_MODE_NAMES = {
+    0: 'none',          # Opaque
+    1: 'transparent',   # Alpha Cutoff (0.75)
+    2: 'blend',         # Alpha Blend
+    3: 'additive',      # Additive
+    4: 'add_alpha',     # AddAlpha
+    5: 'modulate',      # Modulate (Multiply)
+    6: 'modulate_2x',   # Modulate 2X
+}
 
 
 def get_preferences():
@@ -69,7 +78,6 @@ def get_texture_index(root_dirs):
                     if ext in valid_exts:
                         full_p = os.path.join(dirpath, f)
                         dir_cache[f.lower()] = full_p
-                        # Also index relative path from root
                         try:
                             rel_p = os.path.relpath(full_p, root_abs).replace('/', os.sep).replace('\\', os.sep).lower()
                             dir_cache[rel_p] = full_p
@@ -105,13 +113,11 @@ def find_texture_file(image_filename, mdx_file_path, importProperties):
     grandparent_dir = os.path.dirname(parent_dir) if parent_dir else ''
 
     search_roots = []
-    
-    # 1. Custom search dir from import dialog
+
     custom_dir = getattr(importProperties, 'texture_search_dir', '')
     if custom_dir and os.path.isdir(str(custom_dir)):
         search_roots.append(str(custom_dir))
 
-    # 2. Local MDX folder and parent folders (e.g. Work/)
     if mdx_dir and os.path.isdir(mdx_dir):
         search_roots.append(mdx_dir)
     if parent_dir and os.path.isdir(parent_dir):
@@ -119,7 +125,6 @@ def find_texture_file(image_filename, mdx_file_path, importProperties):
     if grandparent_dir and os.path.isdir(grandparent_dir):
         search_roots.append(grandparent_dir)
 
-    # 3. Preferences directories
     pref = get_preferences()
     if pref:
         for p_dir in [getattr(pref, 'resourceFolder', ''), getattr(pref, 'alternativeResourceFolder', '')]:
@@ -127,7 +132,6 @@ def find_texture_file(image_filename, mdx_file_path, importProperties):
             if p_dir_str and os.path.isdir(p_dir_str):
                 search_roots.append(p_dir_str)
 
-    # Fast direct check first
     for s_dir in search_roots:
         cand_rel = os.path.join(s_dir, clean_name)
         if os.path.isfile(cand_rel):
@@ -145,20 +149,16 @@ def find_texture_file(image_filename, mdx_file_path, importProperties):
         if os.path.isfile(cand_imp_sub):
             return cand_imp_sub
 
-    # Use fast indexed search for recursive / case-insensitive matching
     tex_index = get_texture_index(search_roots)
-    
-    # Check exact clean name in index
+
     key_clean = clean_name.lower()
     if key_clean in tex_index:
         return tex_index[key_clean]
 
-    # Check flat basename in index
     key_base = base_name.lower()
     if key_base in tex_index:
         return tex_index[key_base]
 
-    # Check alternative extensions
     for alt_ext in ['.blp', '.png', '.tga', '.dds', '.jpg', '.jpeg']:
         alt_key = (stem + alt_ext).lower()
         if alt_key in tex_index:
@@ -190,9 +190,10 @@ def load_or_convert_texture(found_path, tex_name):
             cache_file = os.path.join(cache_dir, f"{tex_name}_{mtime}_{size}.png")
             if not os.path.exists(cache_file) or os.path.getsize(cache_file) == 0:
                 blp.blp_to_png(found_path, cache_file)
-            
+
             b_img = bpy.data.images.load(cache_file)
             b_img.name = tex_name
+            b_img['wc3_cache_png'] = cache_file
             b_img.pack()
             return b_img
         except Exception as e:
@@ -202,11 +203,205 @@ def load_or_convert_texture(found_path, tex_name):
         try:
             b_img = bpy.data.images.load(found_path)
             b_img.name = tex_name
+            b_img['wc3_cache_png'] = found_path
             b_img.pack()
             return b_img
         except Exception as e:
             print(f"[WarCraft 3] Error loading image {found_path}: {e}")
             return None
+
+
+def _blender_image_to_pil(b_img):
+    """Convert a Blender bpy.types.Image to a PIL RGBA Image."""
+    if not b_img:
+        return None
+    cached_path = b_img.get('wc3_cache_png', None)
+    if cached_path and os.path.isfile(str(cached_path)):
+        try:
+            return Image.open(str(cached_path)).convert('RGBA')
+        except Exception:
+            pass
+    w, h = b_img.size[0], b_img.size[1]
+    if w <= 0 or h <= 0:
+        return None
+    raw = list(b_img.pixels)
+    rgba_bytes = bytearray(w * h * 4)
+    for i in range(w * h):
+        r = int(max(min(raw[i * 4 + 0] * 255.0, 255), 0))
+        g = int(max(min(raw[i * 4 + 1] * 255.0, 255), 0))
+        b = int(max(min(raw[i * 4 + 2] * 255.0, 255), 0))
+        a = int(max(min(raw[i * 4 + 3] * 255.0, 255), 0))
+        rgba_bytes[i * 4 + 0] = r
+        rgba_bytes[i * 4 + 1] = g
+        rgba_bytes[i * 4 + 2] = b
+        rgba_bytes[i * 4 + 3] = a
+    pil_img = Image.frombytes('RGBA', (w, h), bytes(rgba_bytes))
+    return pil_img.transpose(Image.FLIP_TOP_BOTTOM)
+
+
+def composite_team_color_over_texture(team_color_rgb, overlay_b_img, composite_name):
+    """
+    Composite a Layer 0 TeamColor (ReplaceableId 1) + Layer 1 Blend Texture into a single
+    RGBA PNG texture so glTF export displays Team Color + Unit Armor with zero z-fighting.
+    """
+    existing = bpy.data.images.get(composite_name)
+    if existing:
+        return existing
+
+    pil_over = _blender_image_to_pil(overlay_b_img)
+    if pil_over is None:
+        return overlay_b_img
+
+    w, h = pil_over.size
+    r_tc = int(max(min(team_color_rgb[0] * 255.0, 255), 0))
+    g_tc = int(max(min(team_color_rgb[1] * 255.0, 255), 0))
+    b_tc = int(max(min(team_color_rgb[2] * 255.0, 255), 0))
+
+    bg = Image.new('RGBA', (w, h), (r_tc, g_tc, b_tc, 255))
+    comp = Image.alpha_composite(bg, pil_over)
+
+    cache_dir = get_blp_cache_dir()
+    safe_fname = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in composite_name)
+    out_path = os.path.join(cache_dir, f"{safe_fname}.png")
+    comp.save(out_path, 'PNG')
+
+    b_img = bpy.data.images.load(out_path)
+    b_img.name = composite_name
+    b_img['wc3_cache_png'] = out_path
+    b_img.pack()
+    return b_img
+
+
+def bake_alpha_to_rgb_for_additive_texture(src_b_img, tint_rgb=(1.0, 1.0, 1.0), layer_alpha=1.0):
+    """
+    Convert a WarCraft 3 Additive (FilterMode 3) or AddAlpha (FilterMode 4) texture into an
+    UN-PREMULTIPLIED RGBA PNG texture for standard glTF `alphaMode: BLEND`:
+    - Why UN-PREMULTIPLIED?
+      In a radial glow texture like `2 (95)_11.blp`, the outer 70% of the image has dark pixels
+      (`RGB = 10..40`) fading to black (`0,0,0`).
+      In standard glTF `alphaMode: BLEND`, the GPU blends:
+         `FinalColor = src.rgb * src.a + dst.rgb * (1 - src.a)`
+      If `src.rgb` is dark (`10..40`) while `src.a` is `0.15`, the GPU multiplies `dst.rgb * 0.85`
+      and adds almost nothing (`src.rgb * 0.15`), which DARKENS the background into a black box
+      (especially when 21 glow quads stack on top of each other like `Geoset[17]`: `0.85^10 = 0.19` -> 81% BLACK!).
+    - By normalizing `src.rgb = (r / lum) * tint` so `src.rgb` is ALWAYS pure bright color (even in the
+      faintest outer fringe!) and putting `(lum ** 2.0) * tex_a * layer_alpha` in `src.a` (with a hard
+      zero threshold for `lum < 0.08`), the outer black box is 100% transparent (`Alpha = 0`) and
+      the soft glow fringe NEVER darkens the character underneath!
+    """
+    t_key = f"{tint_rgb[0]:.2f}_{tint_rgb[1]:.2f}_{tint_rgb[2]:.2f}_{layer_alpha:.2f}"
+    baked_name = f"GLTF_UnpremGlow_{src_b_img.name}_{t_key}"
+    existing = bpy.data.images.get(baked_name)
+    if existing:
+        return existing
+
+    pil_src = _blender_image_to_pil(src_b_img)
+    if pil_src is None:
+        return src_b_img
+
+    w, h = pil_src.size
+    src_px = pil_src.load()
+    out_img = Image.new('RGBA', (w, h))
+    out_px = out_img.load()
+
+    tr, tg, tb = tint_rgb[0], tint_rgb[1], tint_rgb[2]
+    la = max(min(float(layer_alpha), 1.0), 0.05)
+    base_r = int(max(min(255.0 * tr, 255.0), 0.0))
+    base_g = int(max(min(255.0 * tg, 255.0), 0.0))
+    base_b = int(max(min(255.0 * tb, 255.0), 0.0))
+
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = src_px[x, y]
+            lum = max(r, g, b) / 255.0
+            if lum < 0.06 or a < 5:
+                out_px[x, y] = (base_r, base_g, base_b, 0)
+            else:
+                nr = int(max(min((r / lum) * tr, 255.0), 0.0))
+                ng = int(max(min((g / lum) * tg, 255.0), 0.0))
+                nb = int(max(min((b / lum) * tb, 255.0), 0.0))
+                eff_a = (lum ** 1.8) * (a / 255.0) * la
+                na = int(max(min(eff_a * 255.0, 255.0), 0.0))
+                out_px[x, y] = (nr, ng, nb, na)
+
+    cache_dir = get_blp_cache_dir()
+    safe_fname = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in baked_name)
+    out_path = os.path.join(cache_dir, f"{safe_fname}.png")
+    out_img.save(out_path, 'PNG')
+
+    b_img = bpy.data.images.load(out_path)
+    b_img.name = baked_name
+    b_img['wc3_cache_png'] = out_path
+    b_img.pack()
+    return b_img
+
+
+def is_inverted_outline_shell(model, geoset_idx):
+    """
+    Detect whether a Geoset in `model` is an Inverted-Hull Rim/Outline Shell (such as Geosets
+    10, 11, 12, 13 on custom HeroMoonPriestess models) whose vertex normals intentionally point
+    INWARD (dot product < -0.5 against the base body mesh).
+    """
+    if geoset_idx < 0 or geoset_idx >= len(model.meshes):
+        return False
+    g = model.meshes[geoset_idx]
+    if g.material_id is None or g.material_id >= len(model.materials):
+        return False
+    mat = model.materials[g.material_id]
+    if not mat.layers:
+        return False
+    l0 = mat.layers[0]
+    if len(mat.layers) != 1 or not (l0.shading_flags & 0x1) or (l0.shading_flags & 0x10):
+        return False
+
+    g_bones = set(g.vertex_groups_ids or [])
+    for other_idx, other in enumerate(model.meshes):
+        if other_idx == geoset_idx or len(other.vertices) < len(g.vertices):
+            continue
+        if not (g_bones & set(other.vertex_groups_ids or [])):
+            continue
+        dots = []
+        sample_count = min(30, len(g.vertices))
+        for v, n in zip(g.vertices[:sample_count], g.normals[:sample_count]):
+            best_d = 999999.0
+            best_n = (0.0, 0.0, 1.0)
+            for ov, on in zip(other.vertices, other.normals):
+                d = (v[0] - ov[0]) ** 2 + (v[1] - ov[1]) ** 2 + (v[2] - ov[2]) ** 2
+                if d < best_d:
+                    best_d = d
+                    best_n = on
+            if best_d < 36.0:
+                dots.append(n[0] * best_n[0] + n[1] * best_n[1] + n[2] * best_n[2])
+        if len(dots) >= 5 and (sum(dots) / len(dots)) < -0.5:
+            return True
+    return False
+
+
+def is_stacked_additive_halo_cloud(model, geoset_idx):
+    """
+    Detect whether a Geoset is a cloud of multiple overlapping Additive Halo Quads (such as
+    `Geoset[17]` in `HeroMoonPriestess`, which consists of 21 large intersecting 4-vertex planes
+    using `FilterMode 3` Additive with low alpha `<= 0.35`).
+    In Warcraft 3's hardware Additive Blend (`GL_ONE, GL_ONE`), 21 intersecting black-bordered
+    planes add a faint golden haze. In glTF (which ONLY supports `alphaMode: BLEND`, NOT additive),
+    21 intersecting planes in `DITHERED` or `BLENDED` mode cause severe depth-sorting occlusion
+    and black screen walls in front of the character (`image_fca83d.jpg`)!
+    """
+    if geoset_idx < 0 or geoset_idx >= len(model.meshes):
+        return False
+    g = model.meshes[geoset_idx]
+    if g.material_id is None or g.material_id >= len(model.materials):
+        return False
+    mat = model.materials[g.material_id]
+    if not mat.layers:
+        return False
+    l0 = mat.layers[0]
+    if l0.filter_mode not in (3, 4):
+        return False
+    # Check if geometry is composed entirely of disconnected quads (4 vertices per 2 triangles)
+    if len(g.vertices) >= 16 and len(g.vertices) % 4 == 0 and len(g.triangles) == (len(g.vertices) // 2):
+        return True
+    return False
 
 
 def make_action_cyclic(action):
@@ -271,21 +466,15 @@ def animate_texture_animations(model, bpyMaterials, frameTime):
                     print(f"[WarCraft 3] Error animating texture: {e}")
 
 
-
-
 def purge_orphaned_wc3_actions():
-    """Purge orphaned actions created by this addon.
-
-    Only touches actions tagged by the addon (wc3_armature_name /
-    wc3_object_name); actions from other addons or the user are left alone.
-    """
+    """Purge orphaned actions created by this addon."""
     existing_armatures = {obj.name for obj in bpy.data.objects if obj.type == 'ARMATURE'}
     existing_meshes = {obj.name for obj in bpy.data.objects if obj.type == 'MESH'}
     for act in list(bpy.data.actions):
         arm_tag = act.get('wc3_armature_name', None)
         obj_tag = act.get('wc3_object_name', None)
         if arm_tag is None and obj_tag is None:
-            continue    # not created by this addon - never delete
+            continue
         if arm_tag and arm_tag not in existing_armatures:
             try:
                 bpy.data.actions.remove(act)
@@ -305,11 +494,8 @@ def purge_orphaned_wc3_actions():
 
 def create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages, global_scale=0.03):
     """
-    Convert Warcraft 3 ParticleEmitter2 into functional Blender particle systems:
-    - Zero gravity (no falling snow/rain)
-    - 3-segment color/alpha transitions (Start, Mid, End) via ColorRamp and Particle Info
-    - Sprite sheet flipbook animations for multi-frame particles (e.g. fire, star)
-    - Managed under a dedicated 'WarCraft 3 Particles' collection
+    Convert Warcraft 3 ParticleEmitter2 into functional Blender particle systems
+    (exact original node setup preserved for 100% Blender compatibility).
     """
     if not getattr(model, 'particle_emitters_2', None):
         return []
@@ -338,7 +524,6 @@ def create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages
         bone_name = bone_names[node_id]
         emitter_name = emitter.node.name or f"Emitter_{emitter_idx}"
 
-        # 1. Billboard instance quad placed offscreen
         pw = max(emitter.width * 0.5 * s, 0.15)
         pl = max(emitter.length * 0.5 * s, 0.15)
         bb_verts = [(-pw, 0.0, -pl), (pw, 0.0, -pl), (pw, 0.0, pl), (-pw, 0.0, pl)]
@@ -353,10 +538,9 @@ def create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages
             uv_layer[loop.index].uv = uvs[loop.vertex_index]
 
         bb_obj = bpy.data.objects.new(f"W3_Inst_{emitter_name}_{emitter_idx}", bb_mesh)
-        bb_obj.location = (0.0, 0.0, -1000.0) # Hidden far off-screen
+        bb_obj.location = (0.0, 0.0, -1000.0)
         inst_col.objects.link(bb_obj)
 
-        # 2. Particle Material with ColorRamp and Flipbook
         mat_name = f"W3_PartMat_{emitter_name}_{emitter_idx}"
         mat = bpy.data.materials.new(name=mat_name)
         mat.use_nodes = True
@@ -488,7 +672,6 @@ def create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages
             tex_node.image = tex_img
             tex_node.location = (-150, -100)
 
-        # Shading: Additive vs Alpha Blend
         if emitter.filter_mode == 1:
             add_shader = nodes.new('ShaderNodeAddShader')
             add_shader.location = (450, 0)
@@ -556,7 +739,6 @@ def create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages
 
         bb_mesh.materials.append(mat)
 
-        # 3. Create emitter object attached to parent bone
         em_mesh = bpy.data.meshes.new(f"W3_Em_{emitter_name}_{emitter_idx}")
         em_mesh.from_pydata([(0.0, 0.0, 0.0)], (), ())
         emitter_obj = bpy.data.objects.new(f"W3_Emitter_{emitter_name}_{emitter_idx}", em_mesh)
@@ -567,28 +749,36 @@ def create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages
         emitter_obj.location = (0.0, 0.0, 0.0)
         emitter_obj.rotation_euler = (0.0, 0.0, 0.0)
 
-        # Store emitter metadata for Godot GLB export (glTF extras)
-        emitter_obj['wc3_type'] = 'emitter'
-        emitter_obj['wc3_emitter_name'] = emitter_name
-        emitter_obj['wc3_bone'] = bone_name
-        emitter_obj['wc3_speed'] = float(emitter.speed * s)
-        emitter_obj['wc3_variation'] = float(emitter.variation)
-        emitter_obj['wc3_cone_angle'] = float(getattr(emitter, 'cone_angle', 0.0))
-        emitter_obj['wc3_gravity'] = float(getattr(emitter, 'gravity', 0.0) * s)
-        emitter_obj['wc3_life_span'] = float(emitter.life_span)
-        emitter_obj['wc3_emission_rate'] = float(emitter.emission_rate)
-        emitter_obj['wc3_width'] = float(emitter.width * s)
-        emitter_obj['wc3_length'] = float(emitter.length * s)
-        emitter_obj['wc3_filter_mode'] = int(emitter.filter_mode)
-        emitter_obj['wc3_rows'] = int(emitter.rows)
-        emitter_obj['wc3_columns'] = int(emitter.columns)
-        emitter_obj['wc3_colors'] = [[float(x) for x in c] for c in emitter.segment_colors]
-        emitter_obj['wc3_alphas'] = [float(a / 255.0) for a in emitter.segment_alphas]
-        emitter_obj['wc3_time_middle'] = float(getattr(emitter, 'time_middle', 0.5))
+        emitter_meta = {
+            'wc3_type': 'emitter',
+            'wc3_emitter_name': emitter_name,
+            'wc3_bone': bone_name,
+            'wc3_speed': float(emitter.speed * s),
+            'wc3_variation': float(emitter.variation),
+            'wc3_cone_angle': float(getattr(emitter, 'cone_angle', 0.0)),
+            'wc3_gravity': float(getattr(emitter, 'gravity', 0.0) * s),
+            'wc3_life_span': float(emitter.life_span),
+            'wc3_emission_rate': float(emitter.emission_rate),
+            'wc3_width': float(emitter.width * s),
+            'wc3_length': float(emitter.length * s),
+            'wc3_filter_mode': int(emitter.filter_mode),
+            'wc3_rows': int(emitter.rows),
+            'wc3_columns': int(emitter.columns),
+            'wc3_colors': [[float(x) for x in c] for c in emitter.segment_colors],
+            'wc3_alphas': [float(a / 255.0) for a in emitter.segment_alphas],
+            'wc3_time_middle': float(getattr(emitter, 'time_middle', 0.5)),
+        }
         if tex_img:
-            emitter_obj['wc3_texture'] = tex_img.name
+            emitter_meta['wc3_texture'] = tex_img.name
 
-        # 4. Attach and configure Particle System
+        for k, v in emitter_meta.items():
+            emitter_obj[k] = v
+
+        if bone_name in armatureObject.data.bones:
+            b_data = armatureObject.data.bones[bone_name]
+            for k, v in emitter_meta.items():
+                b_data[k] = v
+
         try:
             ps_mod = emitter_obj.modifiers.new(name="W3_Particles", type='PARTICLE_SYSTEM')
             ps_set = ps_mod.particle_system.settings
@@ -598,7 +788,7 @@ def create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages
             ps_set.lifetime = int(min(max(emitter.life_span * 30.0, 8), 45))
             ps_set.normal_factor = max(emitter.speed * s * 0.4, 0.15)
             ps_set.factor_random = min(max(emitter.variation, 0.1), 0.6)
-            ps_set.effector_weights.gravity = 0.0 # ZERO gravity: float and swirl, NO RAIN/SNOW!
+            ps_set.effector_weights.gravity = 0.0
             ps_set.render_type = 'OBJECT'
             ps_set.instance_object = bb_obj
             ps_set.particle_size = 1.0
@@ -612,109 +802,7 @@ def create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages
     return created_systems
 
 
-def load_warcraft_3_model(model, importProperties):
-    purge_orphaned_wc3_actions()
-    bpyObjects = create_mesh_objects(model, importProperties)
-    armatureObject, bone_names = create_armature_object(model, bpyObjects, importProperties.bone_size)
-
-    # Parent every mesh cleanly to the Armature object
-    for obj in bpyObjects:
-        obj.parent = armatureObject
-        obj.matrix_parent_inverse.identity()
-        obj.location = (0.0, 0.0, 0.0)
-        obj.rotation_euler = (0.0, 0.0, 0.0)
-        obj.scale = (1.0, 1.0, 1.0)
-
-    # Convert particle emitters if enabled
-    g_scale = getattr(importProperties, 'global_scale', 0.03)
-    if getattr(importProperties, 'import_particles', True):
-        bpyImages = getattr(model, 'bpy_images', [])
-        create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages, g_scale)
-
-    # Cache particle data on armature for operator conversion
-    WC3_EMITTERS_CACHE[armatureObject.name] = getattr(model, 'particle_emitters_2', [])
-    armatureObject['wc3_global_scale'] = g_scale
-
-
-    # Animate texture animations on materials
-    bpyMaterials = getattr(model, 'bpy_materials', [])
-    animate_texture_animations(model, bpyMaterials, importProperties.frame_time)
-
-    # Apply global scale and root rotation to the Armature (children meshes inherit it)
-    if hasattr(importProperties, 'global_scale'):
-        s = importProperties.global_scale
-        armatureObject.scale = (s, s, s)
-
-    armatureObject.rotation_euler[2] = -math.radians(90.0)
-
-    # Cameras and lights (created after scaling so clip ranges match)
-    if model.cameras:
-        try:
-            create_cameras(model, armatureObject, importProperties.frame_time)
-        except Exception as e:
-            print('[WarCraft 3] Error importing cameras: {0}'.format(e))
-    if model.lights:
-        try:
-            create_lights(model, armatureObject, bone_names, importProperties.frame_time)
-        except Exception as e:
-            print('[WarCraft 3] Error importing lights: {0}'.format(e))
-
-    create_armature_actions(armatureObject, model, importProperties.frame_time, bone_names)
-    create_object_actions(model, bpyObjects, importProperties.frame_time, armatureObject)
-
-    # Set initial active action to the first real sequence if available (e.g. Stand)
-    target_action = None
-    target_seq_name = None
-    target_idx = 0
-    if model.sequences:
-        for idx, seq in enumerate(model.sequences):
-            if seq.name and seq.name != '#UNANIMATED':
-                act = bpy.data.actions.get(seq.name)
-                if not act:
-                    for a in bpy.data.actions:
-                        if a.get('wc3_armature_name') == armatureObject.name and a.get('wc3_sequence_name') == seq.name:
-                            act = a
-                            break
-                if act:
-                    target_action = act
-                    target_seq_name = seq.name
-                    target_idx = idx + 1 # sequencesList has #UNANIMATED at index 0
-                    break
-    if not target_action:
-        target_action = bpy.data.actions.get('#UNANIMATED')
-        target_seq_name = '#UNANIMATED'
-        target_idx = 0
-
-    if target_action and armatureObject.animation_data:
-        armatureObject.animation_data.action = target_action
-        if hasattr(armatureObject.data, 'warcraft_3'):
-            armatureObject.data.warcraft_3.sequencesListIndex = target_idx
-        if hasattr(target_action, 'frame_range'):
-            bpy.context.scene.frame_start = int(round(target_action.frame_range[0]))
-            bpy.context.scene.frame_end = int(round(target_action.frame_range[1]))
-            bpy.context.scene.frame_current = bpy.context.scene.frame_start
-        
-        # Also assign corresponding mesh actions if any
-        if target_seq_name:
-            for obj in bpyObjects:
-                obj_act = bpy.data.actions.get(target_seq_name + ' ' + obj.name)
-                if not obj_act:
-                    for a in bpy.data.actions:
-                        if a.get('wc3_object_name') == obj.name and a.get('wc3_sequence_name') == target_seq_name:
-                            obj_act = a
-                            break
-                if obj_act:
-                    if obj.animation_data is None:
-                        obj.animation_data_create()
-                    obj.animation_data.action = obj_act
-
-    # Activate and select the armature so the user immediately sees the rig and its animations
-    bpy.context.view_layer.objects.active = armatureObject
-    armatureObject.select_set(True)
-    return armatureObject
-
-
-def create_warcraft3_material(material, material_index, bpyImages, model=None):
+def create_warcraft3_material(material, material_index, bpyImages, model=None, team_color_rgb=(1.0, 0.0, 0.0)):
     layers = material.layers
     if not layers:
         mat = bpy.data.materials.new(name=f"Material_{material_index}")
@@ -723,8 +811,24 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
 
     layer0 = layers[0]
     tex0 = bpyImages[layer0.texture_id] if layer0.texture_id < len(bpyImages) else None
+
+    effective_layer0 = layer0
+    if (
+        len(layers) >= 2
+        and model is not None
+        and 0 <= layer0.texture_id < len(model.textures)
+        and model.textures[layer0.texture_id].replaceable_id == 1
+        and layer0.filter_mode == 0
+    ):
+        layer1 = layers[1]
+        tex1 = bpyImages[layer1.texture_id] if layer1.texture_id < len(bpyImages) else None
+        if tex1 and layer1.filter_mode in (1, 2):
+            comp_name = f"{tex1.name}_TeamColor"
+            tex0 = composite_team_color_over_texture(team_color_rgb, tex1, comp_name)
+            effective_layer0 = layer1
+
     mat_name = tex0.name if tex0 else f"Material_{material_index}"
-    
+
     bpyMaterial = bpy.data.materials.new(name=mat_name)
     bpyMaterial.use_nodes = True
     nodes = bpyMaterial.node_tree.nodes
@@ -734,25 +838,49 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
     output_node = nodes.new('ShaderNodeOutputMaterial')
     output_node.location = (650, 0)
 
-    # Object Info node for live geoset animation color tint and alpha
     obj_info = nodes.new('ShaderNodeObjectInfo')
     obj_info.location = (-650, 150)
 
-    # Determine blend mode and two-sided flags
-    is_two_sided = any(bool(l.shading_flags & 0x10) for l in layers)
+    is_two_sided = bool(effective_layer0.shading_flags & 0x10)
     if is_two_sided:
         bpyMaterial.use_backface_culling = False
     else:
         bpyMaterial.use_backface_culling = True
 
     primary_mode = layer0.filter_mode
+    is_unshaded = bool(effective_layer0.shading_flags & 0x1)
 
-    # ---------------------------------------------------------
+    bpyMaterial['wc3_filter_mode'] = int(primary_mode)
+    bpyMaterial['wc3_blend'] = FILTER_MODE_NAMES.get(primary_mode, 'none')
+    bpyMaterial['wc3_unshaded'] = bool(is_unshaded or primary_mode in (3, 4))
+    bpyMaterial['wc3_two_sided'] = bool(is_two_sided)
+    bpyMaterial['wc3_layer_alpha'] = float(effective_layer0.alpha)
+    bpyMaterial['wc3_coord_id'] = int(effective_layer0.coord_id)
+    bpyMaterial['wc3_mat_index'] = int(material_index)
+
+    sec_layers_info = []
+    self_illum_alpha = 0.0
+    start_sec_idx = 2 if (effective_layer0 is not layer0) else 1
+    for l_idx, l_obj in enumerate(layers[start_sec_idx:], start=start_sec_idx):
+        l_tex = bpyImages[l_obj.texture_id] if (0 <= l_obj.texture_id < len(bpyImages)) else None
+        if l_tex:
+            is_same = bool(l_obj.texture_id == effective_layer0.texture_id)
+            if is_same and (l_obj.filter_mode in (3, 4) or (l_obj.shading_flags & 0x1)):
+                self_illum_alpha = max(self_illum_alpha, float(l_obj.alpha))
+            sec_layers_info.append({
+                'layer_index': int(l_idx),
+                'tex_name': l_tex.name,
+                'texture_id': int(l_obj.texture_id),
+                'same_as_base': is_same,
+                'filter_mode': int(l_obj.filter_mode),
+                'alpha': float(l_obj.alpha),
+                'two_sided': bool(l_obj.shading_flags & 0x10),
+                'unshaded': bool(l_obj.shading_flags & 0x1),
+            })
+    bpyMaterial['wc3_sec_layers'] = sec_layers_info
+    bpyMaterial['wc3_self_illum'] = float(self_illum_alpha)
+
     # CASE 1: Standalone Additive / AddAlpha Material (FilterMode 3 or 4)
-    # Magic glows, halos, missiles, particle cards, ribbons, aura planes
-    # Uses Transparent BSDF + Emission Shader via Add Shader so black areas (0,0,0)
-    # add 0 light (100% transparent), and glowing areas add radiant light.
-    # ---------------------------------------------------------
     if primary_mode in (3, 4):
         bpyMaterial.use_backface_culling = False
         if hasattr(bpyMaterial, 'blend_method'):
@@ -788,7 +916,6 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
                 links.new(coord_node.outputs['UV'], map_node.inputs['Vector'])
                 links.new(map_node.outputs['Vector'], tex_node.inputs['Vector'])
 
-            # Mix texture color with ObjectInfo.Color
             mix_col = nodes.new('ShaderNodeMix')
             mix_col.data_type = 'RGBA'
             mix_col.blend_type = 'MULTIPLY'
@@ -798,7 +925,6 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
             links.new(tex_node.outputs['Color'], mix_col.inputs[7])
             links.new(mix_col.outputs[2], emis_node.inputs['Color'])
 
-            # Modulate emission strength by Texture Alpha, Object Alpha, and Layer Alpha
             math_a = nodes.new('ShaderNodeMath')
             math_a.operation = 'MULTIPLY'
             math_a.location = (-100, 150)
@@ -823,10 +949,7 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
         links.new(add_shader.outputs['Shader'], output_node.inputs['Surface'])
         return bpyMaterial
 
-    # ---------------------------------------------------------
     # CASE 2: Modulate Material (FilterMode 5 or 6)
-    # Multiplicative shadows, decals, projector textures
-    # ---------------------------------------------------------
     elif primary_mode in (5, 6):
         bpyMaterial.use_backface_culling = False
         if hasattr(bpyMaterial, 'blend_method'):
@@ -856,14 +979,10 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
         links.new(transp_bsdf.outputs['BSDF'], output_node.inputs['Surface'])
         return bpyMaterial
 
-    # ---------------------------------------------------------
     # CASE 3: Standard Surfaces (FilterMode 0: Opaque, 1: Transparent Cutoff, 2: Blend)
-    # Characters, units, buildings, armor, weapons
-    # ---------------------------------------------------------
     bsdf = nodes.new('ShaderNodeBsdfPrincipled')
     bsdf.location = (300, 0)
-    
-    # Retro fantasy look: matte roughness, non-metallic, zero specular sheen
+
     if 'Roughness' in bsdf.inputs:
         bsdf.inputs['Roughness'].default_value = 0.8
     if 'Metallic' in bsdf.inputs:
@@ -884,7 +1003,6 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
         if hasattr(bpyMaterial, 'surface_render_method'):
             bpyMaterial.surface_render_method = 'BLENDED'
     else:
-        # primary_mode == 0 (Opaque)
         if hasattr(bpyMaterial, 'blend_method'):
             bpyMaterial.blend_method = 'HASHED'
         if hasattr(bpyMaterial, 'surface_render_method'):
@@ -895,7 +1013,7 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
         tex_node_0.image = tex0
         tex_node_0.location = (-350, 100)
 
-        if layer0.texture_animation_id is not None and model and layer0.texture_animation_id < len(model.texture_animations):
+        if effective_layer0.texture_animation_id is not None and model and effective_layer0.texture_animation_id < len(model.texture_animations):
             coord_node = nodes.new('ShaderNodeTexCoord')
             coord_node.location = (-750, 100)
             map_node = nodes.new('ShaderNodeMapping')
@@ -904,7 +1022,6 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
             links.new(coord_node.outputs['UV'], map_node.inputs['Vector'])
             links.new(map_node.outputs['Vector'], tex_node_0.inputs['Vector'])
 
-        # Mix texture color with ObjectInfo.Color
         mix_col = nodes.new('ShaderNodeMix')
         mix_col.data_type = 'RGBA'
         mix_col.blend_type = 'MULTIPLY'
@@ -914,9 +1031,7 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
         links.new(tex_node_0.outputs['Color'], mix_col.inputs[7])
         links.new(mix_col.outputs[2], bsdf.inputs['Base Color'])
 
-        # Alpha connection
         if primary_mode == 0:
-            # Opaque: only modulates by geoset alpha fade
             links.new(obj_info.outputs['Alpha'], bsdf.inputs['Alpha'])
         else:
             math_alpha = nodes.new('ShaderNodeMath')
@@ -925,25 +1040,23 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
             links.new(tex_node_0.outputs['Alpha'], math_alpha.inputs[0])
             links.new(obj_info.outputs['Alpha'], math_alpha.inputs[1])
 
-            if layer0.alpha < 0.999:
+            if effective_layer0.alpha < 0.999:
                 math_layer_a = nodes.new('ShaderNodeMath')
                 math_layer_a.operation = 'MULTIPLY'
                 math_layer_a.location = (100, -150)
                 links.new(math_alpha.outputs['Value'], math_layer_a.inputs[0])
-                math_layer_a.inputs[1].default_value = layer0.alpha
+                math_layer_a.inputs[1].default_value = effective_layer0.alpha
                 links.new(math_layer_a.outputs['Value'], bsdf.inputs['Alpha'])
             else:
                 links.new(math_alpha.outputs['Value'], bsdf.inputs['Alpha'])
 
-        # Unshaded layer: emits own color for full ambient illumination
-        if layer0.shading_flags & 0x1:
+        if effective_layer0.shading_flags & 0x1:
             links.new(mix_col.outputs[2], bsdf.inputs['Emission Color'])
             bsdf.inputs['Emission Strength'].default_value = 1.0
 
     curr_surface_output = bsdf.outputs['BSDF']
 
-    # Process secondary layers (Layer 1, Layer 2...)
-    for layer_idx, layer in enumerate(layers[1:], start=1):
+    for layer_idx, layer in enumerate(layers[start_sec_idx:], start=start_sec_idx):
         tex = bpyImages[layer.texture_id] if layer.texture_id < len(bpyImages) else None
         if not tex:
             continue
@@ -953,7 +1066,6 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
         tex_node.image = tex
         tex_node.location = (-350, loc_y)
 
-        # Connect Mapping node if texture animation (TVertexAnims) exists
         if layer.texture_animation_id is not None and model and layer.texture_animation_id < len(model.texture_animations):
             coord_node = nodes.new('ShaderNodeTexCoord')
             coord_node.location = (-750, loc_y)
@@ -964,12 +1076,11 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
             links.new(map_node.outputs['Vector'], tex_node.inputs['Vector'])
 
         if layer.filter_mode in (3, 4) or (layer.shading_flags & 0x1):
-            # Additive overlay layer (e.g. animated star shimmer, energy glow)
             add_shader = nodes.new('ShaderNodeAddShader')
             add_shader.location = (550 + 150 * (layer_idx - 1), 0)
 
-            emis = nodes.new('ShaderNodeEmission')
-            emis.location = (350, loc_y)
+            sec_emis_node = nodes.new('ShaderNodeEmission')
+            sec_emis_node.location = (350, loc_y)
 
             mix_c = nodes.new('ShaderNodeMix')
             mix_c.data_type = 'RGBA'
@@ -978,7 +1089,7 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
             mix_c.inputs[0].default_value = 1.0
             links.new(obj_info.outputs['Color'], mix_c.inputs[6])
             links.new(tex_node.outputs['Color'], mix_c.inputs[7])
-            links.new(mix_c.outputs[2], emis.inputs['Color'])
+            links.new(mix_c.outputs[2], sec_emis_node.inputs['Color'])
 
             math_a = nodes.new('ShaderNodeMath')
             math_a.operation = 'MULTIPLY'
@@ -991,10 +1102,10 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
             scale_a.location = (250, loc_y)
             links.new(math_a.outputs['Value'], scale_a.inputs[0])
             scale_a.inputs[1].default_value = layer.alpha
-            links.new(scale_a.outputs['Value'], emis.inputs['Strength'])
+            links.new(scale_a.outputs['Value'], sec_emis_node.inputs['Strength'])
 
             links.new(curr_surface_output, add_shader.inputs[0])
-            links.new(emis.outputs['Emission'], add_shader.inputs[1])
+            links.new(sec_emis_node.outputs['Emission'], add_shader.inputs[1])
             curr_surface_output = add_shader.outputs['Shader']
 
     links.new(curr_surface_output, output_node.inputs['Surface'])
@@ -1003,17 +1114,17 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None):
 
 def create_mesh_objects(model, importProperties):
     setTeamColor = getattr(importProperties, 'set_team_color', 'RED')
+    team_color_rgb = constants.TEAM_COLORS.get(setTeamColor, (1.0, 0.0, 0.0))
     mdx_path = getattr(importProperties, 'mdx_file_path', '')
 
     model.normalize_meshes_names()
     bpyImages = []
 
-    # Replaceable textures dictionary (Cliff, Trees, etc.)
     REPLACEABLE_TEXTURE_PATHS = {
         1: 'ReplaceableTextures\\TeamColor\\TeamColor00.blp',
         2: 'ReplaceableTextures\\TeamGlow\\TeamGlow00.blp',
         11: 'ReplaceableTextures\\Cliff\\Cliff0.blp',
-        21: '',  # Used by cursors
+        21: '',
         31: 'ReplaceableTextures\\LordaeronTree\\LordaeronSummerTree.blp',
         32: 'ReplaceableTextures\\AshenvaleTree\\AshenTree.blp',
         33: 'ReplaceableTextures\\BarrensTree\\BarrensTree.blp',
@@ -1026,7 +1137,7 @@ def create_mesh_objects(model, importProperties):
     for texture in model.textures:
         is_team_color = (texture.replaceable_id == 1)
         is_team_glow = (texture.replaceable_id == 2)
-        
+
         if is_team_color:
             imageFile = constants.TEAM_COLOR_IMAGES.get(setTeamColor, '')
             tex_stem = f"TeamColor_{setTeamColor}"
@@ -1040,30 +1151,25 @@ def create_mesh_objects(model, importProperties):
             imageFile = texture.image_file_name or ''
             tex_stem = os.path.splitext(os.path.basename(imageFile))[0] if imageFile else "Texture"
 
-        # Search on disk
         found_path = find_texture_file(imageFile, mdx_path, importProperties)
         bpyImage = None
 
         if found_path:
             bpyImage = load_or_convert_texture(found_path, tex_stem)
 
-        # Fallbacks for missing files
         if not bpyImage:
             if is_team_color:
-                rgb = constants.TEAM_COLORS.get(setTeamColor, (1.0, 0.0, 0.0))
-                bpyImage = create_solid_color_image(tex_stem, (rgb[0], rgb[1], rgb[2], 1.0))
+                bpyImage = create_solid_color_image(tex_stem, (team_color_rgb[0], team_color_rgb[1], team_color_rgb[2], 1.0))
             elif is_team_glow:
-                rgb = constants.TEAM_COLORS.get(setTeamColor, (1.0, 0.0, 0.0))
-                bpyImage = create_solid_color_image(tex_stem, (rgb[0], rgb[1], rgb[2], 0.75))
+                bpyImage = create_solid_color_image(tex_stem, (team_color_rgb[0], team_color_rgb[1], team_color_rgb[2], 0.75))
             else:
-                # 32x32 neutral placeholder so glTF exporter has a valid image size
                 bpyImage = create_solid_color_image(f"{tex_stem}_placeholder", (0.5, 0.5, 0.5, 1.0), 32, 32)
 
         bpyImages.append(bpyImage)
 
     bpyMaterials = []
     for mat_idx, material in enumerate(model.materials):
-        bpyMaterial = create_warcraft3_material(material, mat_idx, bpyImages, model)
+        bpyMaterial = create_warcraft3_material(material, mat_idx, bpyImages, model, team_color_rgb=team_color_rgb)
         bpyMaterials.append(bpyMaterial)
 
     model.bpy_images = bpyImages
@@ -1076,14 +1182,9 @@ def create_mesh_objects(model, importProperties):
         bpy.context.collection.objects.link(bpyObject)
         bpyMesh.from_pydata(warCraft3Mesh.vertices, (), warCraft3Mesh.triangles)
 
-        # Smooth shading for game models
         for poly in bpyMesh.polygons:
             poly.use_smooth = True
 
-        # Custom split normals from Warcraft 3. Zero-length or NaN normals are
-        # replaced with +Z and the mesh is validated first: on Blender 5.x the
-        # custom-normals API can crash the whole process otherwise once several
-        # models have been imported in the same session.
         if hasattr(warCraft3Mesh, 'normals') and warCraft3Mesh.normals and len(warCraft3Mesh.normals) == len(warCraft3Mesh.vertices) and len(bpyMesh.polygons) > 0:
             try:
                 safeNormals = [
@@ -1101,38 +1202,51 @@ def create_mesh_objects(model, importProperties):
             for loopIndex in range(tris.loop_start, tris.loop_start + tris.loop_total):
                 vertexIndex = bpyMesh.loops[loopIndex].vertex_index
                 uvLayer[loopIndex].uv = (warCraft3Mesh.uvs[vertexIndex])
-        
+
         if warCraft3Mesh.material_id < len(bpyMaterials):
             bpyMaterial = bpyMaterials[warCraft3Mesh.material_id]
             bpyMesh.materials.append(bpyMaterial)
 
-        # Initialize object color and alpha from geoset animation if present
         ga = next((g for g in model.geoset_animations if g.geoset_id == mesh_idx), None)
         if ga:
             init_c = getattr(ga, 'color', (1.0, 1.0, 1.0))
             init_a = getattr(ga, 'alpha', 1.0)
+            # In Warcraft 3 MDX, if KGAO has a static track at t=0 (like Geoset 17's KGAO t=0: alpha=0.3),
+            # that track value overrides the header's default `ga.alpha = 1.0`!
+            if ga.animation_alpha and ga.animation_alpha.tracks_count == 1 and ga.animation_alpha.times[0] == 0:
+                init_a = float(ga.animation_alpha.values[0])
             bpyObject.color = (init_c[0], init_c[1], init_c[2], init_a)
+            max_anim_a = init_a
+            if ga.animation_alpha and ga.animation_alpha.values:
+                max_anim_a = max(max(ga.animation_alpha.values), init_a)
+            bpyObject['wc3_init_alpha'] = float(init_a)
+            bpyObject['wc3_max_alpha'] = float(max_anim_a)
         else:
             bpyObject.color = (1.0, 1.0, 1.0, 1.0)
+            bpyObject['wc3_init_alpha'] = 1.0
+            bpyObject['wc3_max_alpha'] = 1.0
+
+        bpyObject['wc3_geoset_id'] = int(mesh_idx)
+        bpyObject['wc3_selection_flags'] = int(getattr(warCraft3Mesh, 'selection_flags', 0))
+        bpyObject['wc3_is_outline_shell'] = bool(is_inverted_outline_shell(model, mesh_idx))
+        bpyObject['wc3_is_halo_cloud'] = bool(is_stacked_additive_halo_cloud(model, mesh_idx))
 
         for vertexGroupId in warCraft3Mesh.vertex_groups_ids:
             bpyObject.vertex_groups.new(name=str(vertexGroupId))
-            
+
         for vertexIndex, vertexGroupIds in enumerate(warCraft3Mesh.vertex_groups):
             if not vertexGroupIds:
                 continue
-            # Weight normalization: sum must equal 1.0 (crucial for Godot Engine and glTF)
             weight = 1.0 / len(vertexGroupIds)
             for vertexGroupId in vertexGroupIds:
                 bpyObject.vertex_groups[str(vertexGroupId)].add([vertexIndex, ], weight, 'REPLACE')
-                
+
         bpyObjects.append(bpyObject)
 
     return bpyObjects
 
 
 def create_armature_object(model, bpyObjects, boneSize):
-    # Sort nodes by objectId so edit_bones index matches node.node.id perfectly
     model.nodes.sort(key=lambda n: n.node.id if hasattr(n, 'node') and hasattr(n.node, 'id') and n.node.id is not None else 0)
     nodes = model.nodes
     pivotPoints = model.pivot_points
@@ -1143,11 +1257,11 @@ def create_armature_object(model, bpyObjects, boneSize):
     bpy.context.collection.objects.link(bpyObject)
     bpy.context.view_layer.objects.active = bpyObject
     bpy.ops.object.mode_set(mode='EDIT')
-    
+
     nodeTypes = set()
     boneTypes = {}
     bone_names = []
-    
+
     for indexNode, node in enumerate(nodes):
         nodePosition = pivotPoints[indexNode] if indexNode < len(pivotPoints) else (0.0, 0.0, 0.0)
         boneName = node.node.name or f"Node_{indexNode}"
@@ -1156,18 +1270,18 @@ def create_armature_object(model, bpyObjects, boneSize):
         bone.head = nodePosition
         bone.tail = nodePosition
         bone.tail[1] += boneSize
-        bone_names.append(bone.name)  # Store exact name assigned by Blender (handles deduplication)
+        bone_names.append(bone.name)
         boneTypes[bone.name] = node.type
-        
+
     nodeTypes = list(nodeTypes)
     nodeTypes.sort()
-    
+
     for indexNode, node in enumerate(nodes):
         bone = bpyObject.data.edit_bones[indexNode]
         if node.node.parent is not None and node.node.parent < len(bpyObject.data.edit_bones):
             parent = bpyObject.data.edit_bones[node.node.parent]
             bone.parent = parent
-            
+
     for mesh in bpyObjects:
         mesh.modifiers.new(name='Armature', type='ARMATURE')
         mesh.modifiers['Armature'].object = bpyObject
@@ -1180,14 +1294,13 @@ def create_armature_object(model, bpyObjects, boneSize):
                 pass
 
     bpy.ops.object.mode_set(mode='POSE')
-    
-    # Bone Collections (Blender 4.0+ / 5.2)
+
     for nodeType in nodeTypes:
         collection_name = nodeType + 's'
         bone_collection = bpyObject.data.collections.get(collection_name)
         if not bone_collection:
             bone_collection = bpyObject.data.collections.new(collection_name)
-    
+
     for bone in bpyObject.pose.bones:
         bone.rotation_mode = 'XYZ'
         node_type = boneTypes.get(bone.name, 'bone')
@@ -1199,7 +1312,7 @@ def create_armature_object(model, bpyObjects, boneSize):
     for bone in bpyObject.data.bones:
         if hasattr(bone, 'warcraft_3'):
             bone.warcraft_3.nodeType = boneTypes.get(bone.name, 'BONE').upper()
-            
+
     bpy.ops.object.mode_set(mode='OBJECT')
     bpy.context.view_layer.objects.active = None
     return bpyObject, bone_names
@@ -1213,14 +1326,7 @@ def add_sequence_to_armature(sequenceName, armatureObject, actionName=None):
 
 
 def _iter_track_keyframes(track, intervalStart, intervalEnd, frameTime, global_sequences):
-    """Yield (frame, value) pairs of a track within one animation sequence.
-
-    Normal tracks contribute the keyframes whose time falls inside
-    [intervalStart, intervalEnd], rebased so the sequence starts at frame 0.
-    Global-sequence tracks loop with their own period regardless of the
-    playing sequence, so they are unrolled (phase 0 at sequence start) across
-    the whole sequence length.
-    """
+    """Yield (frame, value) pairs of a track within one animation sequence."""
     if track is None or not track.times:
         return
     gsid = getattr(track, 'global_sequence_id', None)
@@ -1246,10 +1352,7 @@ def _iter_track_keyframes(track, intervalStart, intervalEnd, frameTime, global_s
 
 
 def _create_node_channel(action, datablock, dataPath, axisCount, keyframes, interpolationType):
-    """Create one animated channel (XYZ axes) on an action.
-
-    Returns True when at least one axis received real keyframes.
-    """
+    """Create one animated channel (XYZ axes) on an action."""
     if keyframes:
         fcurves = [create_fcurve(action, datablock, dataPath, index=i) for i in range(axisCount)]
         for frame, value in keyframes:
@@ -1279,8 +1382,6 @@ def create_armature_actions(armatureObject, model, frameTime, bone_names):
         add_sequence_to_armature(sequence_name, armatureObject, action.name)
         return action
 
-    # #UNANIMATED only needs to reset nodes that carry animation data; nodes
-    # without any track already sit at their rest pose with no fcurves.
     action = new_action('#UNANIMATED', '#UNANIMATED')
     for indexNode, node in enumerate(nodes):
         if not (node.node.translations or node.node.rotations or node.node.scalings):
@@ -1362,11 +1463,7 @@ def _new_tagged_action(name, sequenceName, armatureName, objectName=None, channe
 
 
 def _write_tracked_channel(track, datablock, staticValue, armatureName, objectName, baseName, channel, sequences, frameTime, global_sequences, scalarFn=None):
-    """Create one action per animation sequence for a vec3 or scalar track.
-
-    scalarFn converts raw track values (e.g. FOV radians to lens mm).
-    Returns the '#UNANIMATED' action.
-    """
+    """Create one action per animation sequence for a vec3 or scalar track."""
     if not sequences:
         return None
     value0 = scalarFn(staticValue) if scalarFn else tuple(staticValue)
@@ -1434,7 +1531,6 @@ def create_cameras(model, armatureObject, frameTime):
                                          model.sequences, frameTime, model.global_sequences)
         if tgt_act:
             target_obj.animation_data.action = tgt_act
-        # FOV animation lives on the camera datablock as 'lens' (millimetres)
         lens_act = _write_tracked_channel(camera.fov_track, cam_data, (camera.field_of_view,),
                                           armatureObject.name, cam_obj.name, cam_obj.name + ' (fov)', 'lens',
                                           model.sequences, frameTime, model.global_sequences,
@@ -1538,7 +1634,9 @@ def create_object_actions(model, bpyObjects, frameTime, armatureObject=None):
         obj = bpyObjects[geosetId]
         init_col = getattr(geosetAnimation, 'color', (1.0, 1.0, 1.0))
         init_alpha = getattr(geosetAnimation, 'alpha', 1.0)
-        
+        if geosetAnimation.animation_alpha and geosetAnimation.animation_alpha.tracks_count == 1 and geosetAnimation.animation_alpha.times[0] == 0:
+            init_alpha = float(geosetAnimation.animation_alpha.values[0])
+
         act_name = '#UNANIMATED' + ' ' + obj.name
         old_act = bpy.data.actions.get(act_name)
         if old_act and old_act.users == 0:
@@ -1560,6 +1658,7 @@ def create_object_actions(model, bpyObjects, frameTime, armatureObject=None):
         colorG.keyframe_points.insert(0.0, init_col[1])
         colorB.keyframe_points.insert(0.0, init_col[2])
         colorA.keyframe_points.insert(0.0, init_alpha)
+
     for sequence in sequences:
         intervalStart = sequence.interval_start
         intervalEnd = sequence.interval_end
@@ -1570,6 +1669,8 @@ def create_object_actions(model, bpyObjects, frameTime, armatureObject=None):
             obj = bpyObjects[geosetId]
             init_col = getattr(geosetAnimation, 'color', (1.0, 1.0, 1.0))
             init_alpha = getattr(geosetAnimation, 'alpha', 1.0)
+            if geosetAnimation.animation_alpha and geosetAnimation.animation_alpha.tracks_count == 1 and geosetAnimation.animation_alpha.times[0] == 0:
+                init_alpha = float(geosetAnimation.animation_alpha.values[0])
             colorAnim = geosetAnimation.animation_color
             alphaAnim = geosetAnimation.animation_alpha
 
@@ -1620,6 +1721,7 @@ def create_object_actions(model, bpyObjects, frameTime, armatureObject=None):
             if not colorB:
                 colorB = create_fcurve(action, obj, dataPathColor, index=2)
                 colorB.keyframe_points.insert(0.0, init_col[2])
+
             interpolationType = constants.INTERPOLATION_TYPE_NAMES[alphaAnim.interpolation_type]
             for index in range(alphaAnim.tracks_count):
                 time = alphaAnim.times[index]
@@ -1636,3 +1738,95 @@ def create_object_actions(model, bpyObjects, frameTime, armatureObject=None):
             if not colorA:
                 colorA = create_fcurve(action, obj, dataPathColor, index=3)
                 colorA.keyframe_points.insert(0.0, init_alpha)
+
+
+def load_warcraft_3_model(model, importProperties):
+    purge_orphaned_wc3_actions()
+    bpyObjects = create_mesh_objects(model, importProperties)
+    armatureObject, bone_names = create_armature_object(model, bpyObjects, importProperties.bone_size)
+
+    for obj in bpyObjects:
+        obj.parent = armatureObject
+        obj.matrix_parent_inverse.identity()
+        obj.location = (0.0, 0.0, 0.0)
+        obj.rotation_euler = (0.0, 0.0, 0.0)
+        obj.scale = (1.0, 1.0, 1.0)
+
+    g_scale = getattr(importProperties, 'global_scale', 0.03)
+    if getattr(importProperties, 'import_particles', True):
+        bpyImages = getattr(model, 'bpy_images', [])
+        create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages, g_scale)
+
+    WC3_EMITTERS_CACHE[armatureObject.name] = getattr(model, 'particle_emitters_2', [])
+    armatureObject['wc3_global_scale'] = g_scale
+
+    bpyMaterials = getattr(model, 'bpy_materials', [])
+    animate_texture_animations(model, bpyMaterials, importProperties.frame_time)
+
+    if hasattr(importProperties, 'global_scale'):
+        s = importProperties.global_scale
+        armatureObject.scale = (s, s, s)
+
+    armatureObject.rotation_euler[2] = -math.radians(90.0)
+
+    if model.cameras:
+        try:
+            create_cameras(model, armatureObject, importProperties.frame_time)
+        except Exception as e:
+            print('[WarCraft 3] Error importing cameras: {0}'.format(e))
+    if model.lights:
+        try:
+            create_lights(model, armatureObject, bone_names, importProperties.frame_time)
+        except Exception as e:
+            print('[WarCraft 3] Error importing lights: {0}'.format(e))
+
+    create_armature_actions(armatureObject, model, importProperties.frame_time, bone_names)
+    create_object_actions(model, bpyObjects, importProperties.frame_time, armatureObject)
+
+    target_action = None
+    target_seq_name = None
+    target_idx = 0
+    if model.sequences:
+        for idx, seq in enumerate(model.sequences):
+            if seq.name and seq.name != '#UNANIMATED':
+                act = bpy.data.actions.get(seq.name)
+                if not act:
+                    for a in bpy.data.actions:
+                        if a.get('wc3_armature_name') == armatureObject.name and a.get('wc3_sequence_name') == seq.name:
+                            act = a
+                            break
+                if act:
+                    target_action = act
+                    target_seq_name = seq.name
+                    target_idx = idx + 1
+                    break
+    if not target_action:
+        target_action = bpy.data.actions.get('#UNANIMATED')
+        target_seq_name = '#UNANIMATED'
+        target_idx = 0
+
+    if target_action and armatureObject.animation_data:
+        armatureObject.animation_data.action = target_action
+        if hasattr(armatureObject.data, 'warcraft_3'):
+            armatureObject.data.warcraft_3.sequencesListIndex = target_idx
+        if hasattr(target_action, 'frame_range'):
+            bpy.context.scene.frame_start = int(round(target_action.frame_range[0]))
+            bpy.context.scene.frame_end = int(round(target_action.frame_range[1]))
+            bpy.context.scene.frame_current = bpy.context.scene.frame_start
+
+        if target_seq_name:
+            for obj in bpyObjects:
+                obj_act = bpy.data.actions.get(target_seq_name + ' ' + obj.name)
+                if not obj_act:
+                    for a in bpy.data.actions:
+                        if a.get('wc3_object_name') == obj.name and a.get('wc3_sequence_name') == target_seq_name:
+                            obj_act = a
+                            break
+                if obj_act:
+                    if obj.animation_data is None:
+                        obj.animation_data_create()
+                    obj.animation_data.action = obj_act
+
+    bpy.context.view_layer.objects.active = armatureObject
+    armatureObject.select_set(True)
+    return armatureObject

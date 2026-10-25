@@ -1,10 +1,169 @@
 import bpy
 import os
+import json
+import struct
 from . import classes
 from . import constants
 from . import parser
+from . import importer
 from . import utils
 from bpy_extras import io_utils
+
+
+GLB_MAGIC = 0x46546C67        # b'glTF'
+JSON_CHUNK_TYPE = 0x4E4F534A  # b'JSON'
+BIN_CHUNK_TYPE = 0x004E4942   # b'BIN\x00'
+
+
+def postprocess_wc3_glb(glb_path, use_khr_emissive_strength=True):
+    """
+    Open an exported .glb file, parse its JSON chunk, enforce exact glTF 2.0 material
+    properties (`alphaMode`, `alphaCutoff`, `doubleSided`, `pbrMetallicRoughness`,
+    `emissiveTexture`, `emissiveFactor`, `KHR_materials_emissive_strength`)
+    from each material's `extras`, and write the valid 4-byte-aligned .glb back to disk.
+    """
+    with open(glb_path, 'rb') as f:
+        data = f.read()
+
+    if len(data) < 20:
+        return False
+
+    magic, version, total_len = struct.unpack_from('<3I', data, 0)
+    if magic != GLB_MAGIC or version != 2:
+        return False
+
+    offset = 12
+    chunks = []
+    json_obj = None
+    json_chunk_idx = -1
+
+    while offset + 8 <= len(data):
+        chunk_len, chunk_type = struct.unpack_from('<2I', data, offset)
+        offset += 8
+        chunk_bytes = data[offset : offset + chunk_len]
+        offset += chunk_len
+        if chunk_type == JSON_CHUNK_TYPE and json_obj is None:
+            json_str = chunk_bytes.decode('utf-8').rstrip(' \t\r\n\x00')
+            json_obj = json.loads(json_str)
+            json_chunk_idx = len(chunks)
+        chunks.append([chunk_type, chunk_bytes])
+
+    if json_obj is None or json_chunk_idx < 0:
+        return False
+
+    extensions_used = set(json_obj.get('extensionsUsed', []))
+    materials = json_obj.get('materials', [])
+
+    for mat in materials:
+        extras = mat.get('extras')
+        if not isinstance(extras, dict):
+            continue
+
+        filter_mode = extras.get('wc3_filter_mode', None)
+        if filter_mode is None:
+            continue
+        filter_mode = int(filter_mode)
+        unshaded = bool(extras.get('wc3_unshaded', False))
+        two_sided = bool(extras.get('wc3_two_sided', False))
+        layer_alpha = float(extras.get('wc3_layer_alpha', 1.0))
+        self_illum = float(extras.get('wc3_self_illum', 0.0))
+        tint = extras.get('wc3_tint', [1.0, 1.0, 1.0, 1.0])
+        if not isinstance(tint, (list, tuple)) or len(tint) < 4:
+            tint = [1.0, 1.0, 1.0, layer_alpha]
+
+        mat['doubleSided'] = bool(two_sided)
+
+        pbr = mat.setdefault('pbrMetallicRoughness', {})
+        pbr['metallicFactor'] = 0.0
+        pbr['roughnessFactor'] = 0.85
+
+        base_tex_info = pbr.get('baseColorTexture')
+        emis_tex_info = mat.get('emissiveTexture')
+        tex_info = base_tex_info or emis_tex_info
+
+        if tex_info and 'baseColorTexture' not in pbr:
+            pbr['baseColorTexture'] = dict(tex_info)
+
+        if filter_mode == 0:
+            mat['alphaMode'] = 'OPAQUE'
+            mat.pop('alphaCutoff', None)
+            pbr['baseColorFactor'] = [
+                float(tint[0]),
+                float(tint[1]),
+                float(tint[2]),
+                1.0
+            ]
+        elif filter_mode == 1:
+            mat['alphaMode'] = 'MASK'
+            mat['alphaCutoff'] = 0.5
+            pbr['baseColorFactor'] = [
+                float(tint[0]),
+                float(tint[1]),
+                float(tint[2]),
+                1.0
+            ]
+        elif filter_mode == 2:
+            mat['alphaMode'] = 'BLEND'
+            mat.pop('alphaCutoff', None)
+            pbr['baseColorFactor'] = [
+                float(tint[0]),
+                float(tint[1]),
+                float(tint[2]),
+                float(max(min(tint[3], 1.0), 0.05))
+            ]
+        elif filter_mode in (3, 4):
+            mat['alphaMode'] = 'BLEND'
+            mat['doubleSided'] = True
+            mat.pop('alphaCutoff', None)
+            pbr['baseColorFactor'] = [1.0, 1.0, 1.0, 1.0]
+            if tex_info:
+                mat['emissiveTexture'] = dict(tex_info)
+            mat['emissiveFactor'] = [1.0, 1.0, 1.0]
+            if use_khr_emissive_strength:
+                ext = mat.setdefault('extensions', {})
+                ext['KHR_materials_emissive_strength'] = {'emissiveStrength': 2.0}
+                extensions_used.add('KHR_materials_emissive_strength')
+        elif filter_mode in (5, 6):
+            mat['alphaMode'] = 'BLEND'
+            mat['doubleSided'] = True
+            mat.pop('alphaCutoff', None)
+            pbr['baseColorFactor'] = [
+                float(tint[0]),
+                float(tint[1]),
+                float(tint[2]),
+                float(max(min(tint[3], 1.0), 0.05))
+            ]
+
+        if filter_mode not in (3, 4) and tex_info:
+            if unshaded:
+                mat['emissiveTexture'] = dict(tex_info)
+                mat['emissiveFactor'] = [0.5, 0.5, 0.5]
+            elif self_illum > 0.01:
+                s_val = float(max(min(self_illum, 1.0), 0.0))
+                mat['emissiveTexture'] = dict(tex_info)
+                mat['emissiveFactor'] = [s_val, s_val, s_val]
+
+    if extensions_used:
+        json_obj['extensionsUsed'] = sorted(extensions_used)
+
+    new_json_bytes = json.dumps(json_obj, separators=(',', ':')).encode('utf-8')
+    pad_len = (4 - (len(new_json_bytes) % 4)) % 4
+    if pad_len > 0:
+        new_json_bytes += b' ' * pad_len
+
+    chunks[json_chunk_idx][1] = new_json_bytes
+
+    new_total_len = 12 + sum(8 + len(c[1]) for c in chunks)
+    out = bytearray()
+    out += struct.pack('<3I', GLB_MAGIC, 2, new_total_len)
+    for c_type, c_bytes in chunks:
+        out += struct.pack('<2I', len(c_bytes), c_type)
+        out += c_bytes
+
+    with open(glb_path, 'wb') as f:
+        f.write(out)
+
+    return True
 
 
 def find_scene_armature(context):
@@ -92,7 +251,7 @@ class WarCraft3OperatorImportMDX(bpy.types.Operator, io_utils.ImportHelper):
         if self.autoImportTextures:
             layout.prop(self, 'textureSearchDir')
         layout.prop(self, 'importParticles')
-            
+
         layout.separator()
         split = layout.split(factor=0.9)
         subSplit = split.split(factor=0.5)
@@ -125,7 +284,6 @@ class WarCraft3OperatorImportMDX(bpy.types.Operator, io_utils.ImportHelper):
             traceback.print_exc()
             return {'CANCELLED'}
 
-        # Automatically switch 3D Viewport to Material Preview so user immediately sees textures
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
                 for space in area.spaces:
@@ -198,6 +356,11 @@ class WarCraft3OperatorPushToNLA(bpy.types.Operator):
     bl_description = 'Create NLA tracks for each animation sequence so they are easily accessible in the NLA Editor and exportable to glTF/Godot'
     bl_options = {'UNDO'}
 
+    includeUnanimated: bpy.props.BoolProperty(
+        name='Include #UNANIMATED Track',
+        default=False
+    )
+
     def execute(self, context):
         arm = find_scene_armature(context)
         if not arm:
@@ -205,21 +368,33 @@ class WarCraft3OperatorPushToNLA(bpy.types.Operator):
             return {'CANCELLED'}
         if not arm.animation_data:
             arm.animation_data_create()
-            
+
         wc3 = getattr(arm.data, 'warcraft_3', None)
         if not wc3 or not wc3.sequencesList:
             self.report({'WARNING'}, "No animation sequences found on armature")
             return {'CANCELLED'}
-        
-        # Clear existing NLA tracks to ensure fresh, clean sequence list
+
         for track in list(arm.animation_data.nla_tracks):
             arm.animation_data.nla_tracks.remove(track)
-        
+        for child in arm.children:
+            if child.animation_data:
+                for track in list(child.animation_data.nla_tracks):
+                    child.animation_data.nla_tracks.remove(track)
+                if child.type == 'MESH':
+                    child.animation_data.action = None
+
         created = 0
         for seq in wc3.sequencesList:
             if not seq.name:
                 continue
+            if seq.name == '#UNANIMATED' and not self.includeUnanimated:
+                continue
             act = bpy.data.actions.get(seq.name)
+            if not act:
+                for a in bpy.data.actions:
+                    if a.get('wc3_armature_name') == arm.name and a.get('wc3_sequence_name') == seq.name and not a.get('wc3_object_name'):
+                        act = a
+                        break
             if not act:
                 continue
             track = arm.animation_data.nla_tracks.new()
@@ -233,137 +408,211 @@ class WarCraft3OperatorPushToNLA(bpy.types.Operator):
                     strip.action_slot = act.slots[0]
             track.mute = False
             created += 1
-        
+
         self.report({'INFO'}, f"Pushed {created} animation sequences to NLA tracks on {arm.name}")
         return {'FINISHED'}
 
 
-def _flatten_wc3_material(src, obj_color=(1.0, 1.0, 1.0, 1.0)):
-    """Build a glTF-friendly copy of a WarCraft 3 material.
-
-    The importer's materials route textures through ObjectInfo tints and
-    Add-Shader emission, which the glTF exporter cannot translate — the
-    textures get dropped and re-imported models render untextured/black.
-    The flat copy plugs the layer-0 texture straight into Base Color /
-    Alpha (and Emission for unshaded or additive materials) so the
-    exporter embeds it.
-
-    obj_color is the source mesh's object color: the importer wires it
-    into ObjectInfo, where WC3 stores the layer tint and blend alpha
-    (e.g. additive splash quads tint warm at 30% alpha). Returns None
-    when no usable texture is found.
+def _build_gltf_material_from_nodes(tex_img, filter_mode, unshaded=False, two_sided=False, tint_rgb=(1.0, 1.0, 1.0), effective_alpha=1.0, self_illum=0.0, mat_name="GLTF_Mat", src_meta=None):
     """
-    img = None
-    unshaded = False
-    additive = False
-    if not src.use_nodes:
+    Create a single-layer glTF-exporter-ready Principled BSDF material.
+    """
+    additive = filter_mode in (3, 4)
+    flat = bpy.data.materials.new(mat_name)
+    flat.use_nodes = True
+    flat.use_backface_culling = False if (two_sided or filter_mode in (3, 4)) else True
+
+    if filter_mode == 0:
+        if hasattr(flat, 'blend_method'):
+            flat.blend_method = 'OPAQUE'
+        if hasattr(flat, 'surface_render_method'):
+            flat.surface_render_method = 'DITHERED'
+    elif filter_mode == 1:
+        if hasattr(flat, 'blend_method'):
+            flat.blend_method = 'CLIP'
+        if hasattr(flat, 'alpha_threshold'):
+            flat.alpha_threshold = 0.5
+        if hasattr(flat, 'surface_render_method'):
+            flat.surface_render_method = 'DITHERED'
+    else:
+        if hasattr(flat, 'blend_method'):
+            flat.blend_method = 'BLEND'
+        if hasattr(flat, 'surface_render_method'):
+            flat.surface_render_method = 'BLENDED'
+
+    fn = flat.node_tree.nodes
+    fl = flat.node_tree.links
+    fn.clear()
+    out = fn.new('ShaderNodeOutputMaterial')
+    out.location = (400, 0)
+
+    export_img = tex_img
+    if additive and tex_img is not None:
+        try:
+            export_img = importer.bake_alpha_to_rgb_for_additive_texture(
+                tex_img, tint_rgb=tint_rgb, layer_alpha=effective_alpha
+            )
+        except Exception:
+            export_img = tex_img
+
+    tex = fn.new('ShaderNodeTexImage')
+    tex.image = export_img
+    tex.location = (-350, 0)
+
+    bsdf = fn.new('ShaderNodeBsdfPrincipled')
+    bsdf.location = (100, 0)
+    if 'Roughness' in bsdf.inputs:
+        bsdf.inputs['Roughness'].default_value = 0.85
+    if 'Metallic' in bsdf.inputs:
+        bsdf.inputs['Metallic'].default_value = 0.0
+    if 'Specular IOR Level' in bsdf.inputs:
+        bsdf.inputs['Specular IOR Level'].default_value = 0.0
+
+    fl.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
+
+    if filter_mode == 1:
+        rnd = fn.new('ShaderNodeMath')
+        rnd.operation = 'ROUND'
+        rnd.location = (-100, -150)
+        fl.new(tex.outputs['Alpha'], rnd.inputs[0])
+        fl.new(rnd.outputs['Value'], bsdf.inputs['Alpha'])
+    elif filter_mode >= 2:
+        fl.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
+
+    if unshaded or additive:
+        fl.new(tex.outputs['Color'], bsdf.inputs['Emission Color'])
+        bsdf.inputs['Emission Strength'].default_value = 2.0 if additive else 0.5
+    elif self_illum > 0.01:
+        fl.new(tex.outputs['Color'], bsdf.inputs['Emission Color'])
+        bsdf.inputs['Emission Strength'].default_value = float(self_illum)
+
+    fl.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+
+    if src_meta:
+        for k, v in src_meta.items():
+            if not k.startswith('_') and k != 'wc3_sec_layers':
+                flat[k] = v
+    flat['wc3_filter_mode'] = int(filter_mode)
+    flat['wc3_blend'] = importer.FILTER_MODE_NAMES.get(filter_mode, 'none')
+    flat['wc3_tint'] = [float(tint_rgb[0]), float(tint_rgb[1]), float(tint_rgb[2]), float(effective_alpha)]
+    flat['wc3_layer_alpha'] = float(effective_alpha)
+    flat['wc3_self_illum'] = float(self_illum)
+    flat['wc3_unshaded'] = bool(unshaded or additive)
+    flat['wc3_two_sided'] = bool(two_sided or filter_mode in (3, 4))
+    return flat
+
+
+def _flatten_wc3_material(src, obj_color=(1.0, 1.0, 1.0, 1.0)):
+    """Build a glTF-friendly copy of a WarCraft 3 material's primary layer."""
+    if not src or not src.use_nodes:
         return None
     nodes = src.node_tree.nodes
-    out_node = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
-    if out_node and out_node.inputs['Surface'].is_linked:
-        surface = out_node.inputs['Surface'].links[0].from_node
-        additive = surface.type == 'ADD_SHADER'
+    img = None
     for n in nodes:
-        if n.type == 'BSDF_PRINCIPLED' and n.inputs.get('Emission Color') and n.inputs['Emission Color'].is_linked:
-            unshaded = True
-    for n in nodes:  # layer-0 texture node is created first by the importer
         if n.type == 'TEX_IMAGE' and n.image:
             img = n.image
             break
     if img is None:
         return None
 
-    tint = (obj_color[0], obj_color[1], obj_color[2], 1.0)
-    tinted = abs(tint[0] - 1.0) + abs(tint[1] - 1.0) + abs(tint[2] - 1.0) > 0.01
+    filter_mode = src.get('wc3_filter_mode', None)
+    if filter_mode is None:
+        has_bsdf = any(n.type == 'BSDF_PRINCIPLED' for n in nodes)
+        has_add = any(n.type == 'ADD_SHADER' for n in nodes)
+        if has_add and not has_bsdf:
+            filter_mode = 3
+        elif getattr(src, 'blend_method', '') == 'CLIP':
+            filter_mode = 1
+        elif getattr(src, 'blend_method', '') == 'BLEND' or getattr(src, 'surface_render_method', '') == 'BLENDED':
+            filter_mode = 2
+        else:
+            filter_mode = 0
 
-    flat = bpy.data.materials.new('GLTF_' + src.name)
-    flat.use_nodes = True
-    fn = flat.node_tree.nodes
-    fl = flat.node_tree.links
-    fn.clear()
-    out = fn.new('ShaderNodeOutputMaterial')
-    bsdf = fn.new('ShaderNodeBsdfPrincipled')
-    bsdf.inputs['Roughness'].default_value = 0.8
-    bsdf.inputs['Metallic'].default_value = 0.0
-    if 'Specular IOR Level' in bsdf.inputs:
-        bsdf.inputs['Specular IOR Level'].default_value = 0.0
-    tex = fn.new('ShaderNodeTexImage')
-    tex.image = img
+    unshaded = bool(src.get('wc3_unshaded', False))
+    two_sided = bool(src.get('wc3_two_sided', not src.use_backface_culling))
+    self_illum = float(src.get('wc3_self_illum', 0.0))
+    if self_illum <= 0.001 and filter_mode == 0:
+        has_bsdf = any(n.type == 'BSDF_PRINCIPLED' for n in nodes)
+        has_add = any(n.type == 'ADD_SHADER' for n in nodes)
+        if has_bsdf and has_add:
+            self_illum = 0.20
 
-    color_out = tex.outputs['Color']
-    if tinted:
-        # texture color x layer tint (WC3 layer color via object color)
-        mix = fn.new('ShaderNodeMix')
-        mix.data_type = 'RGBA'
-        mix.blend_type = 'MULTIPLY'
-        mix.inputs[6].default_value = tint  # A
-        fl.new(tex.outputs['Color'], mix.inputs[7])  # B
-        color_out = mix.outputs[2]
-    fl.new(color_out, bsdf.inputs['Base Color'])
+    tint_rgb = (float(obj_color[0]), float(obj_color[1]), float(obj_color[2]))
+    obj_alpha = float(obj_color[3]) if len(obj_color) > 3 else 1.0
+    effective_alpha = max(min(obj_alpha, 1.0), 0.15)
 
-    if additive and obj_color[3] < 0.9:
-        # Layered effects (layer alpha < 0.9, e.g. stacked splash-aura
-        # quads). WC3 adds texture * layerAlpha on every overlapping quad,
-        # while glTF BLEND darkens the more layers stack. Emulate the
-        # additive build-up with a small per-layer alpha (layerAlpha^2)
-        # paired with boosted emission (1/layerAlpha), so one layer adds
-        # as much light as WC3 and stacked layers keep getting brighter.
-        mul = fn.new('ShaderNodeMath')
-        mul.operation = 'MULTIPLY'
-        mul.use_clamp = True
-        fl.new(tex.outputs['Alpha'], mul.inputs[0])
-        mul.inputs[1].default_value = obj_color[3] * obj_color[3]
-        fl.new(mul.outputs['Value'], bsdf.inputs['Alpha'])
-    elif additive:
-        # Full-alpha additive surfaces: gate alpha by texel luminance so
-        # dark texels stay invisible instead of darkening the scene.
-        bw = fn.new('ShaderNodeRGBToBW')
-        gate = fn.new('ShaderNodeMath')
-        gate.operation = 'MULTIPLY'
-        gate.use_clamp = True
-        fl.new(tex.outputs['Color'], bw.inputs['Color'])
-        fl.new(bw.outputs['Val'], gate.inputs[0])
-        fl.new(tex.outputs['Alpha'], gate.inputs[1])
-        fl.new(gate.outputs['Value'], bsdf.inputs['Alpha'])
-    else:
-        fl.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
-    if unshaded or additive:
-        # glTF has emissiveTexture; preserves glows without scene lighting.
-        # The emission input must be the raw texture: routing it through a
-        # tint Mix node makes the exporter fold the strength into
-        # emissiveFactor and clamp it at 1. Linked directly, strength > 1
-        # round-trips as KHR_materials_emissive_strength.
-        strength = 0.3
-        if additive and obj_color[3] < 0.9:
-            strength = min(3.5, 1.0 / obj_color[3])
-        fl.new(tex.outputs['Color'], bsdf.inputs['Emission Color'])
-        bsdf.inputs['Emission Strength'].default_value = strength
-    fl.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-    flat.use_backface_culling = src.use_backface_culling
-    if hasattr(flat, 'surface_render_method') and hasattr(src, 'surface_render_method'):
-        flat.surface_render_method = src.surface_render_method
-    if hasattr(flat, 'alpha_threshold') and hasattr(src, 'alpha_threshold'):
-        flat.alpha_threshold = src.alpha_threshold
-
-    # Store extras metadata for Godot Engine
-    flat['wc3_blend'] = 'additive' if additive else ('unshaded' if unshaded else 'blend')
-    flat['wc3_tint'] = [float(tint[0]), float(tint[1]), float(tint[2]), float(obj_color[3])]
-    flat['wc3_layer_alpha'] = float(obj_color[3])
-    flat['wc3_unshaded'] = bool(unshaded or additive)
-    flat['wc3_src_material'] = src.name
-    return flat
+    return _build_gltf_material_from_nodes(
+        img, filter_mode, unshaded=unshaded, two_sided=two_sided,
+        tint_rgb=tint_rgb, effective_alpha=effective_alpha,
+        self_illum=self_illum, mat_name='GLTF_' + src.name, src_meta=src
+    )
 
 
-def _swap_materials_for_gltf(export_objects):
-    """Temporarily replace WC3 node materials with flat glTF ones.
-
-    Returns (swaps, temporaries): swaps is a list of (mesh, slot index,
-    original material) used to restore after export; temporaries are the
-    flat materials to remove afterwards.
+def _is_blender_obj_halo_cloud(obj):
     """
+    Check if a Blender Mesh Object is a stacked additive halo quad cloud (like Geoset 17 in
+    HeroMoonPriestess: 84 vertices = 21 disconnected 4-vertex quads with an Additive material).
+    Works both on newly imported models (`wc3_is_halo_cloud`) and existing `.blend` scenes.
+    """
+    if bool(obj.get('wc3_is_halo_cloud', False)):
+        return True
+    mesh = getattr(obj, 'data', None)
+    if not mesh or not hasattr(mesh, 'vertices') or not hasattr(mesh, 'polygons'):
+        return False
+    v_cnt = len(mesh.vertices)
+    p_cnt = len(mesh.polygons)
+    if v_cnt >= 16 and (v_cnt % 4 == 0) and p_cnt == (v_cnt // 2):
+        for slot in obj.material_slots:
+            mat = slot.material
+            if not mat:
+                continue
+            if mat.get('wc3_filter_mode') in (3, 4):
+                return True
+            if mat.use_nodes and mat.node_tree:
+                n_types = {n.type for n in mat.node_tree.nodes}
+                if 'ADD_SHADER' in n_types and 'BSDF_PRINCIPLED' not in n_types:
+                    return True
+    return False
+
+
+def _is_blender_obj_outline_shell(obj):
+    """
+    Check if a Blender Mesh Object is an inverted-hull toon outline shell (like Geosets 10, 11, 12, 13
+    in HeroMoonPriestess). Works both on newly imported models (`wc3_is_outline_shell`) and existing
+    `.blend` scenes.
+    """
+    if bool(obj.get('wc3_is_outline_shell', False)):
+        return True
+    for slot in obj.material_slots:
+        mat = slot.material
+        if not mat:
+            continue
+        if not mat.use_backface_culling:
+            continue
+        is_blend = (
+            mat.get('wc3_filter_mode') == 2
+            or getattr(mat, 'blend_method', '') == 'BLEND'
+            or getattr(mat, 'surface_render_method', '') == 'BLENDED'
+        )
+        if is_blend and mat.use_nodes and mat.node_tree:
+            # Check if it's a single-texture unshaded blend shell with backface culling enabled
+            tex_nodes = [n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image]
+            bsdf_nodes = [n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED']
+            if len(tex_nodes) == 1 and len(bsdf_nodes) == 1:
+                bsdf = bsdf_nodes[0]
+                emis_in = bsdf.inputs.get('Emission Color') if hasattr(bsdf.inputs, 'get') else None
+                if bool(mat.get('wc3_unshaded', False)) or (emis_in and getattr(emis_in, 'is_linked', False)):
+                    return True
+    return False
+
+
+def _prepare_export_meshes_and_materials(context, arm, export_set):
     swaps = []
+    temp_materials = []
+    temp_meshes_objs = []
     by_key = {}
-    for obj in export_objects:
+
+    for obj in list(export_set):
         if obj.type != 'MESH':
             continue
         for i, slot in enumerate(obj.material_slots):
@@ -371,24 +620,68 @@ def _swap_materials_for_gltf(export_objects):
             if not src or not src.use_nodes:
                 continue
             col = tuple(obj.color) if hasattr(obj, 'color') else (1.0, 1.0, 1.0, 1.0)
-            key = (src.name, round(col[0], 3), round(col[1], 3), round(col[2], 3), round(col[3], 3))
+            bake_a = col[3]
+            if bake_a < 0.05:
+                bake_a = float(obj.get('wc3_max_alpha', 1.0))
+                if bake_a < 0.05:
+                    bake_a = 1.0
+            bake_col = (col[0], col[1], col[2], bake_a)
+
+            key = (src.name, round(bake_col[0], 3), round(bake_col[1], 3), round(bake_col[2], 3), round(bake_col[3], 3))
             flat = by_key.get(key)
             if flat is None:
-                flat = _flatten_wc3_material(src, col)
+                flat = _flatten_wc3_material(src, bake_col)
                 by_key[key] = flat
+                if flat:
+                    temp_materials.append(flat)
             if flat:
                 slot.material = flat
                 swaps.append((obj, i, src))
-                if flat.get('wc3_blend') == 'additive':
-                    obj['wc3_blend'] = 'additive'
-                obj['wc3_color'] = [float(c) for c in col]
-    return swaps, [m for m in by_key.values() if m]
+                obj['wc3_filter_mode'] = int(flat.get('wc3_filter_mode', 0))
+                obj['wc3_blend'] = str(flat.get('wc3_blend', 'none'))
+                obj['wc3_color'] = [float(c) for c in bake_col]
+
+            sec_layers = src.get('wc3_sec_layers', [])
+            if sec_layers:
+                for sec_info in sec_layers:
+                    if sec_info.get('same_as_base', False):
+                        continue
+                    sec_tex_name = sec_info.get('tex_name', '')
+                    sec_img = bpy.data.images.get(sec_tex_name)
+                    if not sec_img or 'placeholder' in sec_img.name.lower():
+                        continue
+                    sec_idx = sec_info.get('layer_index', 1)
+                    sec_alpha = float(sec_info.get('alpha', 0.5)) * bake_col[3]
+                    sec_key = (src.name, f"L{sec_idx}", sec_img.name, round(bake_col[0], 3), round(bake_col[1], 3), round(bake_col[2], 3))
+                    sec_mat = by_key.get(sec_key)
+                    if sec_mat is None:
+                        sec_mat = _build_gltf_material_from_nodes(
+                            sec_img, filter_mode=int(sec_info.get('filter_mode', 3)),
+                            unshaded=True, two_sided=bool(sec_info.get('two_sided', True)),
+                            tint_rgb=(bake_col[0], bake_col[1], bake_col[2]),
+                            effective_alpha=sec_alpha,
+                            mat_name=f"GLTF_{src.name}_L{sec_idx}"
+                        )
+                        by_key[sec_key] = sec_mat
+                        temp_materials.append(sec_mat)
+
+                    dup_mesh = obj.data.copy()
+                    dup_mesh.materials.clear()
+                    dup_mesh.materials.append(sec_mat)
+                    dup_obj = obj.copy()
+                    dup_obj.name = f"{obj.name}_OverlayL{sec_idx}"
+                    dup_obj.data = dup_mesh
+                    context.scene.collection.objects.link(dup_obj)
+                    export_set.add(dup_obj)
+                    temp_meshes_objs.append((dup_obj, dup_mesh))
+
+    return swaps, temp_materials, temp_meshes_objs
 
 
 class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper):
     bl_idname = 'warcraft_3.export_godot_glb'
     bl_label = 'Export for Godot (.glb)'
-    bl_description = 'Export model, embedded textures, and all animation sequences ready for Godot Engine (excludes Blender particle helpers, flattens WC3 shaders to glTF-safe materials)'
+    bl_description = 'Export model, embedded textures, and all animation sequences ready for Godot Engine & Blender'
     bl_options = {'UNDO'}
 
     filename_ext = '.glb'
@@ -397,8 +690,28 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
 
     exportAllActions: bpy.props.BoolProperty(
         name='Export All Animation Sequences',
-        description='Export all model sequences as separate animations for Godot AnimationPlayer',
+        description='Export all model sequences as separate animations for Godot AnimationPlayer & Blender',
         default=True
+    )
+    skipStackedHaloClouds: bpy.props.BoolProperty(
+        name='Exclude Stacked Additive Halo Quads (Fixes Black Boxes)',
+        description='Exclude Geosets composed of dozens of intersecting Additive Halo Quads (such as Geoset 17 in HeroMoonPriestess) that cause black box walls in glTF',
+        default=True
+    )
+    skipOutlineShells: bpy.props.BoolProperty(
+        name='Exclude Inverted-Hull Rim Shells (Fixes Flat Blue Tiger)',
+        description='Exclude inverted-hull toon outline shell Geosets (such as Geosets 10, 11, 12, 13)',
+        default=True
+    )
+    skipHiddenSpellMeshes: bpy.props.BoolProperty(
+        name='Exclude Hidden / Unanimated Effect Meshes',
+        description='Exclude Geosets whose alpha is 0 across all animations',
+        default=True
+    )
+    exportCamerasAndLights: bpy.props.BoolProperty(
+        name='Export WC3 Portrait Cameras & Lights',
+        description='Include WarCraft 3 portrait camera and light objects in the exported .glb',
+        default=False
     )
 
     def execute(self, context):
@@ -407,41 +720,8 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
             self.report({'ERROR'}, "No Armature found in scene to export")
             return {'CANCELLED'}
 
-        # Ensure active object is arm
         context.view_layer.objects.active = arm
 
-        # Export the WarCraft 3 model: armature + mesh / camera / light children.
-        # W3_Inst_* billboard helpers are excluded so they do not leak geometry.
-        # W3_Emitter_* objects are converted into lightweight Empty marker nodes
-        # attached to bones, carrying particle parameters in glTF extras for Godot.
-        export_set = {arm}
-        temp_empties = []
-        for child in list(arm.children):
-            if child.name.startswith('W3_Inst_'):
-                continue
-            if child.name.startswith('W3_Emitter_'):
-                empty = bpy.data.objects.new(child.name, None)
-                empty.parent = arm
-                empty.parent_type = child.parent_type
-                empty.parent_bone = child.parent_bone
-                empty.location = child.location
-                empty.rotation_euler = child.rotation_euler
-                empty.scale = child.scale
-                for k, v in child.items():
-                    if not k.startswith('_'):
-                        empty[k] = v
-                context.scene.collection.objects.link(empty)
-                export_set.add(empty)
-                temp_empties.append(empty)
-                continue
-            if child.type in {'MESH', 'CAMERA', 'LIGHT', 'EMPTY'}:
-                export_set.add(child)
-        bpy.ops.object.select_all(action='DESELECT')
-        for obj in export_set:
-            obj.select_set(True)
-        context.view_layer.objects.active = arm
-
-        # Ensure all skinned meshes are parented to Armature for glTF
         for obj in context.scene.objects:
             if obj.type == 'MESH':
                 for mod in obj.modifiers:
@@ -450,13 +730,34 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
                             obj.parent = arm
                             obj.matrix_parent_inverse = arm.matrix_world.inverted()
 
-        # Push sequences to NLA tracks so only this model's animations are exported
-        if self.exportAllActions:
-            bpy.ops.warcraft_3.push_to_nla()
+        export_set = {arm}
+        for child in list(arm.children):
+            if child.name.startswith('W3_Inst_') or child.name.startswith('W3_Emitter_'):
+                continue
+            if child.type == 'MESH':
+                if self.skipHiddenSpellMeshes and float(child.get('wc3_max_alpha', 1.0)) < 0.02:
+                    continue
+                if self.skipOutlineShells and _is_blender_obj_outline_shell(child):
+                    continue
+                if self.skipStackedHaloClouds and _is_blender_obj_halo_cloud(child):
+                    continue
+                export_set.add(child)
+            elif self.exportCamerasAndLights and child.type in {'CAMERA', 'LIGHT', 'EMPTY'}:
+                export_set.add(child)
 
-        # WC3 node materials (ObjectInfo tint / Add-Shader emission) are not
-        # glTF-translatable; swap in flat textured copies for the export.
-        swaps, temporaries = _swap_materials_for_gltf(export_set)
+        saved_action = arm.animation_data.action if arm.animation_data else None
+
+        if self.exportAllActions:
+            bpy.ops.warcraft_3.push_to_nla(includeUnanimated=False)
+            if arm.animation_data:
+                arm.animation_data.action = None
+
+        swaps, temp_materials, temp_meshes_objs = _prepare_export_meshes_and_materials(context, arm, export_set)
+
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in export_set:
+            obj.select_set(True)
+        context.view_layer.objects.active = arm
 
         try:
             bpy.ops.export_scene.gltf(
@@ -465,13 +766,14 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
                 use_selection=True,
                 export_animation_mode='NLA_TRACKS' if self.exportAllActions else 'ACTIVE_ACTIONS',
                 export_anim_slide_to_zero=True,
-                export_optimize_animation_size=True,
+                export_optimize_animation_size=False,
                 export_image_format='AUTO',
                 export_materials='EXPORT',
-                export_cameras=True,
+                export_cameras=bool(self.exportCamerasAndLights),
                 export_apply=False,
                 export_extras=True,
             )
+            postprocess_wc3_glb(self.filepath, use_khr_emissive_strength=True)
             self.report({'INFO'}, f"Successfully exported for Godot: {os.path.basename(self.filepath)}")
             result = {'FINISHED'}
         except Exception as e:
@@ -480,19 +782,25 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
             traceback.print_exc()
             result = {'CANCELLED'}
         finally:
+            if arm.animation_data and saved_action:
+                arm.animation_data.action = saved_action
             for obj, idx, src in swaps:
                 try:
                     obj.material_slots[idx].material = src
                 except Exception:
                     pass
-            for tmp in temporaries:
+            for dup_obj, dup_mesh in temp_meshes_objs:
                 try:
-                    bpy.data.materials.remove(tmp, do_unlink=True)
+                    bpy.data.objects.remove(dup_obj, do_unlink=True)
                 except Exception:
                     pass
-            for empty in temp_empties:
                 try:
-                    bpy.data.objects.remove(empty, do_unlink=True)
+                    bpy.data.meshes.remove(dup_mesh, do_unlink=True)
+                except Exception:
+                    pass
+            for tmp in temp_materials:
+                try:
+                    bpy.data.materials.remove(tmp, do_unlink=True)
                 except Exception:
                     pass
         return result
@@ -510,7 +818,7 @@ class WarCraft3OperatorExportGodotGLB(bpy.types.Operator, io_utils.ExportHelper)
 class WarCraft3OperatorCleanBoneShapes(bpy.types.Operator):
     bl_idname = 'warcraft_3.clean_bone_shapes'
     bl_label = 'Fix glTF Display (Hide Spheres)'
-    bl_description = 'Remove Icosphere bone shapes created by Blender when re-importing glTF, revealing the clean model mesh'
+    bl_description = 'Remove Icosphere bone shapes created by Blender when re-importing glTF, fix EEVEE Next BLENDED materials, and populate sequence list from NLA tracks'
     bl_options = {'UNDO'}
 
     def execute(self, context):
@@ -525,14 +833,38 @@ class WarCraft3OperatorCleanBoneShapes(bpy.types.Operator):
                     b.custom_shape = None
                     cleaned_bones += 1
 
-        # Check for unused Icosphere object created by glTF importer
+            if hasattr(a.data, 'warcraft_3') and a.animation_data and a.animation_data.nla_tracks:
+                wc3 = a.data.warcraft_3
+                if len(wc3.sequencesList) == 0:
+                    for track in a.animation_data.nla_tracks:
+                        if track.strips:
+                            strip = track.strips[0]
+                            if strip.action:
+                                item = wc3.sequencesList.add()
+                                item.name = track.name
+                                item.action_name = strip.action.name
+                    if len(wc3.sequencesList) > 0:
+                        wc3.sequencesListIndex = 0
+
         for obj in list(bpy.data.objects):
             if obj.type == 'MESH' and 'icosphere' in obj.name.lower():
                 in_use = any(b.custom_shape == obj for a in bpy.data.objects if a.type == 'ARMATURE' for b in a.pose.bones)
                 if not in_use:
                     bpy.data.objects.remove(obj, do_unlink=True)
+            elif obj.type == 'MESH':
+                for slot in obj.material_slots:
+                    mat = slot.material
+                    if mat and mat.get('wc3_filter_mode', 0) >= 2:
+                        if hasattr(mat, 'surface_render_method'):
+                            mat.surface_render_method = 'BLENDED'
 
-        self.report({'INFO'}, f"Cleaned {cleaned_bones} bone shapes. Clean mesh restored!")
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D' and space.shading.type == 'SOLID':
+                        space.shading.type = 'MATERIAL'
+
+        self.report({'INFO'}, f"Cleaned {cleaned_bones} bone shapes and restored animation list!")
         return {'FINISHED'}
 
 
@@ -543,7 +875,6 @@ class WarCraft3OperatorConvertParticles(bpy.types.Operator):
     bl_options = {'UNDO'}
 
     def execute(self, context):
-        from . import importer
         arm = find_scene_armature(context)
         if not arm or arm.type != 'ARMATURE':
             self.report({'WARNING'}, "No WarCraft 3 armature found")
@@ -553,7 +884,6 @@ class WarCraft3OperatorConvertParticles(bpy.types.Operator):
         bone_names = [b.name for b in arm.data.bones]
         g_scale = arm.get('wc3_global_scale', 0.03)
 
-        # Remove existing particle objects if present
         col = bpy.data.collections.get("WarCraft 3 Particles")
         if col:
             for obj in list(col.objects):
@@ -594,4 +924,3 @@ class WarCraft3OperatorToggleParticles(bpy.types.Operator):
         status = "Hidden" if col.hide_viewport else "Visible"
         self.report({'INFO'}, f"WarCraft 3 Particles is now {status}")
         return {'FINISHED'}
-

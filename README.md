@@ -102,6 +102,12 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 
 ## 📋 Changelog
 
+### v1.5.5
+- **Direct GLB Binary Post-Processor (`postprocess_wc3_glb`)**:
+  - Enforces exact glTF 2.0 material properties directly into the exported `.glb` binary (`alphaMode`, `alphaCutoff`, `doubleSided`, `pbrMetallicRoughness`, `emissiveTexture`, `emissiveFactor`, `KHR_materials_emissive_strength`) parsed from `extras`.
+  - Ensures 100% compliant 4-byte aligned GLB files for Godot, Unity, Unreal Engine & web engines.
+  - Multi-layer material separation and geoset visibility improvements.
+
 ### v1.4.4
 - **Godot Engine 4 Pipeline Perfection (glTF Extras & Particle Emitters)**:
   - GLB export now writes custom metadata into glTF `extras`: marks additive materials (`wc3_blend: "additive"`), layer tint, and layer alpha.
@@ -241,6 +247,10 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 
 ## 📋 Lịch sử thay đổi (Tóm tắt)
 
+- **v1.5.5** — Bộ xử lý nhị phân GLB trực tiếp (`postprocess_wc3_glb`):
+  - Tự động phân tích và ghi đè trực tiếp các thuộc tính glTF 2.0 vào binary của file `.glb` (`alphaMode`, `alphaCutoff`, `doubleSided`, `emissiveFactor`, `KHR_materials_emissive_strength`) dựa trên metadata `extras`.
+  - Đảm bảo file `.glb` chuẩn cấu trúc căn hàng 4-byte cho Godot, Unity, Unreal Engine và WebGL.
+  - Tối ưu tách geoset nhiều lớp và xử lý animation visibility cho game engine.
 - **v1.4.4** — Hoàn thiện xuất cho Godot Engine 4:
   - Xuất GLB kèm metadata mở rộng `extras`: đánh dấu vật liệu additive (`wc3_blend: "additive"`), tint màu và alpha từng lớp.
   - Chuyển đổi các hệ hạt (`W3_Emitter_*`) thành các node Marker rỗng gắn trên đúng xương mang đầy đủ thông số hạt (tốc độ, trọng lực, dải màu, vòng đời, tỷ lệ phát hạt).
