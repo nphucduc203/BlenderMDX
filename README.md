@@ -7,7 +7,7 @@
 
 **English** | [Tiếng Việt](#-tiếng-việt)
 
-A modern, high-performance addon for **Blender 4.2, 4.5, and 5.2 LTS** to import **WarCraft 3** 3D models (`.mdx`), textures (`.blp`), particle emitters, and animations with full fidelity matching Retera Model Studio and the in-game engine.
+A modern, high-performance addon for **Blender 4.2, 4.5, and 5.2 LTS** to import **WarCraft 3** 3D models (`.mdx` binary and `.mdl` text), textures (`.blp`), particle emitters, and animations with full fidelity matching Retera Model Studio and the in-game engine.
 
 ![BlenderMDX Preview](docs/preview.png)
 
@@ -15,6 +15,7 @@ A modern, high-performance addon for **Blender 4.2, 4.5, and 5.2 LTS** to import
 
 ## ✨ Features
 
+- **Dual MDX + MDL Import**: the binary `.mdx` and the text `.mdl` form of the same model land in the identical internal model, so geometry, skeleton, materials, tracks and emitters import the same way from either format.
 - **Full MDX Chunk Support**:
   - `GEOS` & `GEOA`: Geosets, vertex groups, UV channels, normals, and geoset visibility animations.
   - `BONE` & `HELP`: Complete hierarchical skeleton with bones and helper nodes.
@@ -25,7 +26,7 @@ A modern, high-performance addon for **Blender 4.2, 4.5, and 5.2 LTS** to import
   - `TXAN` & `GLBS`: Texture coordinate animations (`TVertexAnims`) and global sequences.
   - `CAMS`: Model cameras imported as Blender cameras (with animated target empty, Track To constraint, and FOV → focal length animation).
   - `LITE`: Omnidirectional/directional lights parented into the bone hierarchy, with animated color and intensity.
-  - **Reforged Compatibility**: accepts MDX version 800 *and* 1000, and skips Reforged-only chunks (`CORN`, `BORN`, `FAFX`) gracefully.
+  - **Reforged Compatibility**: loads version 800 *and* version 900/1000 files (unknown versions warn instead of aborting) and skips Reforged-only chunks (`CORN`, `BORN`, `FAFX`). Reforged-only *fields* (the 256-byte model name, material shader name, emissive/fresnel layer values) are not parsed yet, so version 900+ materials keep classic defaults.
 
 - **High-Fidelity Texturing & Shading**:
   - Direct native `.blp` image decoding (JPEG & DXT1/DXT3/DXT5 compressed BLP formats).
@@ -97,11 +98,18 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
    - **Export Compatible GLB (Standard PBR)**: Standard glTF PBR for universal 3D viewers (Windows 3D Viewer, web). Uses frozen approximation formulas (`layerAlpha²` + boosted emission).
 2. **Previewing the GLB in Blender**: Blender's glTF importer draws each bone as a stretched octahedron with an Icosphere custom shape. This is a *display artifact of the importer* — the shapes are not in the file and Godot does not show them. Press **Fix glTF Display (Hide Spheres)** in the WarCraft 3 tab to clean the viewport.
 
-> **Note**: `.mdl` (text format) is not supported — convert to `.mdx` with Retera Model Studio first.
+> **Note**: both `.mdx` (binary) and `.mdl` (text) are imported through the same menu — the format is detected from the file itself, not the extension.
 
 ---
 
 ## 📋 Changelog
+
+### v1.7.0
+- **Text `.mdl` import**: `File > Import > WarCraft 3 (.mdx, .mdl)` reads the text format through the same pipeline — geosets, layers, bones/helpers/attachments, animation tracks (with or without the `LineType` keyword), pivot points, and the `PRE2` / `RIBB` / `Light` / `Camera` / `CollisionShape` / `EventObject` blocks. The format is sniffed from the file contents, so a mislabelled extension still imports.
+- **Tag-driven geoset reading**: `VRTX/NRMS/PVTX/GNDX/MTGC/MATS/UVAS/UVBS` are read in any order instead of Blizzard's exact write order, so models written by other tools no longer abort mid-geoset; an unknown sub-chunk now warns and keeps what was parsed.
+- **Correct geoset tint colors**: `GEOA` static color is RGB, only the animated `KGAC` track is BGR. Red and blue used to be swapped on every tinted geoset (`2 (95).mdx` geoset 17 imported as peach instead of light blue).
+- **Correct `PRE2` emitter area**: the binary reader assigned `length` to `width` and the other way around.
+- **Warcraft objectIds are not list indices**: pivots, bone parenting, skin binding and light/emitter parenting resolve nodes by `objectId`. The old code assumed ids were exactly `0..N-1` in sorted order, which models with dropped or renumbered nodes violate.
 
 ### v1.6.0
 - **Industry-Standard 2-Tier Architecture**:
@@ -250,12 +258,17 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
    - **Export Compatible GLB (Standard PBR)**: Định dạng glTF PBR chuẩn cho các trình xem 3D phổ thông (Windows 3D Viewer, web). Sử dụng công thức xấp xỉ cố định (`layerAlpha²` + emission tăng cường).
 2. **Xem trước GLB bằng Blender**: glTF importer của Blender vẽ mỗi bone thành khung bát diện giãn dài kèm hình Icosphere. Đây là *artifact hiển thị của importer* — các hình này không nằm trong file và Godot không hiển thị chúng. Bấm **Fix glTF Display (Hide Spheres)** trong tab WarCraft 3 để dọn sạch viewport.
 
-> **Lưu ý**: định dạng `.mdl` (văn bản) không được hỗ trợ — hãy chuyển sang `.mdx` bằng Retera Model Studio trước.
+> **Lưu ý**: cả `.mdx` (nhị phân) và `.mdl` (văn bản) đều nhập qua cùng một menu — định dạng được nhận từ nội dung file, không phải phần đuôi.
 
 ---
 
 ## 📋 Lịch sử thay đổi (Tóm tắt)
 
+- **v1.7.0** — Nhập định dạng văn bản `.mdl` và sửa lỗi đọc MDX:
+  - `.mdx` (nhị phân) và `.mdl` (văn bản) dùng chung một pipeline; định dạng được nhận từ nội dung file.
+  - Geoset đọc theo tag (`VRTX/NRMS/PVTX/GNDX/MTGC/MATS/UVAS/UVBS`) nên không còn hỏng khi thứ tự khác trình của Blizzard.
+  - Màu `GEOA` tĩnh là RGB (chỉ track `KGAC` là BGR) — trước đây mọi geoset tint bị đảo đỏ/xanh.
+  - Sửa thứ tự `length`/`width` của `PRE2`; pivot/cha/skin tra theo `objectId` thay vì theo vị trí danh sách.
 - **v1.6.0** — Kiến trúc 2 tầng (2-Tier Architecture) chuẩn công nghiệp:
   - **Export Lossless GLB + WC3 Extensions**: 1 geoset nhiều layer xuất thành N primitive trong 1 mesh glTF! Giữ nguyên `layerAlpha` gốc (không fake alpha, không bình phương), nhúng siêu dữ liệu `extras` cho game engine. Kèm 17 emitter marker trên xương.
   - **Export Compatible GLB (Standard PBR)**: Giữ nguyên công thức xấp xỉ PBR tĩnh (`layerAlpha²` + emission 0.3/boosted) chạy độc lập trên mọi trình xem 3D.

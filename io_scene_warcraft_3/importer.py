@@ -516,12 +516,12 @@ def create_particle_emitter_systems(model, armatureObject, bone_names, bpyImages
 
     s = global_scale
     created_systems = []
+    bonesByObjectId = {node.node.id: bone_names[index] for index, node in enumerate(model.nodes)}
 
     for emitter_idx, emitter in enumerate(model.particle_emitters_2):
-        node_id = emitter.node.id if emitter.node else -1
-        if node_id is None or node_id >= len(bone_names) or node_id < 0:
+        bone_name = bonesByObjectId.get(emitter.node.id) if emitter.node else None
+        if bone_name is None:
             continue
-        bone_name = bone_names[node_id]
         emitter_name = emitter.node.name or f"Emitter_{emitter_idx}"
 
         pw = max(emitter.width * 0.5 * s, 0.15)
@@ -1203,7 +1203,7 @@ def create_mesh_objects(model, importProperties):
                 vertexIndex = bpyMesh.loops[loopIndex].vertex_index
                 uvLayer[loopIndex].uv = (warCraft3Mesh.uvs[vertexIndex])
 
-        if warCraft3Mesh.material_id < len(bpyMaterials):
+        if warCraft3Mesh.material_id is not None and warCraft3Mesh.material_id < len(bpyMaterials):
             bpyMaterial = bpyMaterials[warCraft3Mesh.material_id]
             bpyMesh.materials.append(bpyMaterial)
 
@@ -1261,9 +1261,12 @@ def create_armature_object(model, bpyObjects, boneSize):
     nodeTypes = set()
     boneTypes = {}
     bone_names = []
+    bonesByObjectId = {}
 
     for indexNode, node in enumerate(nodes):
-        nodePosition = pivotPoints[indexNode] if indexNode < len(pivotPoints) else (0.0, 0.0, 0.0)
+        # PIVT and the parent field are Warcraft objectIds, which need not be contiguous.
+        nodeId = node.node.id
+        nodePosition = pivotPoints[nodeId] if nodeId is not None and nodeId < len(pivotPoints) else (0.0, 0.0, 0.0)
         boneName = node.node.name or f"Node_{indexNode}"
         nodeTypes.add(node.type)
         bone = bpyArmature.edit_bones.new(boneName)
@@ -1271,27 +1274,27 @@ def create_armature_object(model, bpyObjects, boneSize):
         bone.tail = nodePosition
         bone.tail[1] += boneSize
         bone_names.append(bone.name)
+        bonesByObjectId[nodeId] = bone.name
         boneTypes[bone.name] = node.type
 
     nodeTypes = list(nodeTypes)
     nodeTypes.sort()
 
     for indexNode, node in enumerate(nodes):
-        bone = bpyObject.data.edit_bones[indexNode]
-        if node.node.parent is not None and node.node.parent < len(bpyObject.data.edit_bones):
-            parent = bpyObject.data.edit_bones[node.node.parent]
-            bone.parent = parent
+        parentBoneName = bonesByObjectId.get(node.node.parent)
+        if parentBoneName is not None and parentBoneName != bone_names[indexNode]:
+            bpyObject.data.edit_bones[indexNode].parent = bpyObject.data.edit_bones[parentBoneName]
 
     for mesh in bpyObjects:
         mesh.modifiers.new(name='Armature', type='ARMATURE')
         mesh.modifiers['Armature'].object = bpyObject
         for vertexGroup in mesh.vertex_groups:
             try:
-                vertexGroupIndex = int(vertexGroup.name)
-                if vertexGroupIndex < len(bone_names):
-                    vertexGroup.name = bone_names[vertexGroupIndex]
+                boneName = bonesByObjectId.get(int(vertexGroup.name))
             except ValueError:
-                pass
+                continue
+            if boneName:
+                vertexGroup.name = boneName
 
     bpy.ops.object.mode_set(mode='POSE')
 
@@ -1622,6 +1625,7 @@ def _light_sequence_actions(light, light_data, armatureName, sequences, frameTim
 def create_lights(model, armatureObject, bone_names, frameTime):
     """Import LITE entries as Blender lights parented into the node hierarchy."""
     arm_scale = armatureObject.scale[0] if armatureObject.scale and armatureObject.scale[0] else 0.03
+    bonesByObjectId = {node.node.id: bone_names[index] for index, node in enumerate(model.nodes)}
     for light in model.lights:
         baseName = (light.node.name if light.node and light.node.name else 'Light')
         light_data = bpy.data.lights.new(baseName, 'POINT')
@@ -1637,10 +1641,11 @@ def create_lights(model, armatureObject, bone_names, frameTime):
                 pass
         light_obj = bpy.data.objects.new(baseName, light_data)
         parentId = light.node.parent if light.node else None
-        if parentId is not None and 0 <= parentId < len(bone_names):
+        parentBoneName = bonesByObjectId.get(parentId)
+        if parentBoneName is not None:
             light_obj.parent = armatureObject
             light_obj.parent_type = 'BONE'
-            light_obj.parent_bone = bone_names[parentId]
+            light_obj.parent_bone = parentBoneName
             light_obj.location = (0.0, 0.0, 0.0)
         else:
             light_obj.parent = armatureObject

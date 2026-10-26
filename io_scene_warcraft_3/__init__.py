@@ -1,11 +1,11 @@
 bl_info = {
     'name': 'WarCraft 3 .mdx Importer & Game Engine .glb Exporter',
     'author': 'nphucduc203, Torenjk, Pavel_Blend, Nekuromu',
-    'version': (1, 6, 0),
+    'version': (1, 7, 0),
     'blender': (4, 2, 0),
     'category': 'Import-Export',
     'location': 'File > Import / Export',
-    'description': 'Import WarCraft 3 *.mdx models and export full multi-layer *.glb for Godot, Unity, Unreal & Blender 5.2',
+    'description': 'Import WarCraft 3 *.mdx / *.mdl models and export full multi-layer *.glb for Godot, Unity, Unreal & Blender 5.2',
     'wiki_url': 'https://github.com/nphucduc203/BlenderMDX',
     'tracker_url': 'https://github.com/nphucduc203/BlenderMDX/issues'
 }
@@ -20,6 +20,7 @@ from . import (
     types,
     preferences,
     importer,
+    mdl,
     parser,
     operators,
     ui,
@@ -35,6 +36,7 @@ for _mod in (
     types,
     preferences,
     importer,
+    mdl,
     parser,
     operators,
     ui,

@@ -12,6 +12,9 @@ __pycache__/
 *.zip
 *.tar.gz
 
+# Vendored third-party reference repos (local reading only)
+.reference/
+
 # IDE and Editor files
 .vscode/
 .idea/

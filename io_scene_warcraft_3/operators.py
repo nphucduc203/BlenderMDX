@@ -201,12 +201,12 @@ def find_scene_armature(context):
 
 class WarCraft3OperatorImportMDX(bpy.types.Operator, io_utils.ImportHelper):
     bl_idname = 'warcraft_3.import_mdx'
-    bl_label = 'Import *.mdx'
-    bl_description = 'Import *.mdx files (3d models of WarCraft 3)'
+    bl_label = 'Import *.mdx / *.mdl'
+    bl_description = 'Import *.mdx (binary) and *.mdl (text) files (3d models of WarCraft 3)'
     bl_options = {'UNDO'}
 
     filename_ext = '.mdx'
-    filter_glob: bpy.props.StringProperty(default='*.mdx', options={'HIDDEN'})
+    filter_glob: bpy.props.StringProperty(default='*.mdx;*.mdl', options={'HIDDEN'})
     filepath: bpy.props.StringProperty(name='File Path', maxlen=1024, default='')
     textureSearchDir: bpy.props.StringProperty(
         name='Texture Folder',
@@ -299,7 +299,7 @@ class WarCraft3OperatorImportMDX(bpy.types.Operator, io_utils.ImportHelper):
         try:
             parser.load_mdx(importProperties)
         except Exception as e:
-            self.report({'ERROR'}, f"Failed to import MDX: {e}")
+            self.report({'ERROR'}, f"Failed to import MDX/MDL: {e}")
             import traceback
             traceback.print_exc()
             return {'CANCELLED'}

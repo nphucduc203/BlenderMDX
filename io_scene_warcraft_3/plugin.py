@@ -6,7 +6,7 @@ from . import ui
 
 
 def menu_import_mdx(self, context):
-    self.layout.operator(operators.WarCraft3OperatorImportMDX.bl_idname, text='WarCraft 3 (.mdx)')
+    self.layout.operator(operators.WarCraft3OperatorImportMDX.bl_idname, text='WarCraft 3 (.mdx, .mdl)')
 
 
 def menu_export_lossless(self, context):

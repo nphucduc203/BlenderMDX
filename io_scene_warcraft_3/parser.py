@@ -4,6 +4,7 @@ from . import classes
 from . import constants
 from . import importer
 from . import binary
+from . import mdl
 
 
 def parse_model(data, model):
@@ -242,101 +243,71 @@ def get_vertex_groups(matrixGroups, matrixGroupsSizes, matrixIndices):
 
 
 def parse_geometry(data):
+    """GEOS record: tagged sub-chunks of 'tag + count + data', no size field and no fixed order."""
     r = binary.Reader(data)
+    dataSize = len(data)
     mesh = classes.WarCraft3Mesh()
     mesh.name = 'temp'
-    ############################################################################
-    chunkId = r.getid(constants.CHUNK_VERTEX_POSITION)
-    vertexCount = r.getf('<I')[0]
-    for _ in range(vertexCount):
-        vertexPositionX, vertexPositionY, vertexPositionZ = r.getf('<3f')
-        mesh.vertices.append((vertexPositionX, vertexPositionY, vertexPositionZ))
-    ############################################################################
-    chunkId = r.getid(constants.CHUNK_VERTEX_NORMAL)
-    normalsCount = r.getf('<I')[0]
-    for _ in range(normalsCount):
-        normal = r.getf('<3f')
-        mesh.normals.append(normal)
-    ############################################################################
-    chunkId = r.getid(constants.CHUNK_FACE_TYPE_GROUP)
-    faceTypeGroupsCount = r.getf('<I')[0]
-    for _ in range(faceTypeGroupsCount):
-        faceType = r.getf('<I')[0]
-    ############################################################################
-    chunkId = r.getid(constants.CHUNK_FACE_GROUP)
-    faceGroupCount = r.getf('<I')[0]
-    for _ in range(faceGroupCount):
-        indexesCount = r.getf('<I')[0]
-    ############################################################################
-    chunkId = r.getid(constants.CHUNK_FACE)
-    indicesCount = r.getf('<I')[0]
-    if indicesCount % 3 != 0:
-        raise Exception('bad indices (indicesCount % 3 != 0)')
-    for _ in range(indicesCount // 3):
-        vertexIndex1, vertexIndex2, vertexIndex3 = r.getf('<3H')
-        mesh.triangles.append((vertexIndex1, vertexIndex2, vertexIndex3))
-    ############################################################################
-    chunkId = r.getid(constants.CHUNK_VERTEX_GROUP)
-    matrixGroupsCount = r.getf('<I')[0]
     matrixGroups = []
-    for _ in range(matrixGroupsCount):
-        matrixGroup = r.getf('<B')[0]
-        matrixGroups.append(matrixGroup)
-    ############################################################################
-    chunkId = r.getid(constants.CHUNK_MATRIX_GROUP)
-    matrixGroupsSizesCount = r.getf('<I')[0]
     matrixGroupsSizes = []
-    for _ in range(matrixGroupsSizesCount):
-        matrixGroupSize = r.getf('<I')[0]
-        matrixGroupsSizes.append(matrixGroupSize)
-    ############################################################################
-    chunkId = r.getid(constants.CHUNK_MATRIX_INDEX)
-    matrixIndicesCount = r.getf('<I')[0]
     matrixIndices = []
-    for _ in range(matrixIndicesCount):
-        matrixIndex = r.getf('<I')[0]
-        matrixIndices.append(matrixIndex)
-    ############################################################################
+    faceTypes = []
+    while r.offset + 8 <= dataSize:
+        chunkId = r.getid()
+        count = r.getf('<I')[0]
+        if chunkId == constants.CHUNK_VERTEX_POSITION:
+            if count > (dataSize - r.offset) // 12:
+                raise Exception('bad geoset vertex data (count {0})'.format(count))
+            for _ in range(count):
+                mesh.vertices.append(r.getf('<3f'))
+        elif chunkId == constants.CHUNK_VERTEX_NORMAL:
+            for _ in range(min(count, (dataSize - r.offset) // 12)):
+                mesh.normals.append(r.getf('<3f'))
+        elif chunkId == constants.CHUNK_FACE_TYPE_GROUP:
+            faceTypes = [r.getf('<I')[0] for _ in range(count)]
+        elif chunkId == constants.CHUNK_FACE_GROUP:
+            r.skip(min(4 * count, dataSize - r.offset))
+        elif chunkId == constants.CHUNK_FACE:
+            if count % 3:
+                print('[WarCraft 3] Geoset index count {0} is not a multiple of 3 '
+                      '(strip/fan?); the rest of this geoset is skipped.'.format(count))
+                break
+            for _ in range(count // 3):
+                mesh.triangles.append(r.getf('<3H'))
+        elif chunkId == constants.CHUNK_VERTEX_GROUP:
+            matrixGroups = [r.getf('<B')[0] for _ in range(min(count, dataSize - r.offset))]
+        elif chunkId == constants.CHUNK_MATRIX_GROUP:
+            matrixGroupsSizes = [r.getf('<I')[0] for _ in range(count)]
+        elif chunkId == constants.CHUNK_MATRIX_INDEX:
+            matrixIndices = [r.getf('<I')[0] for _ in range(count)]
+            ############################################################################
+            # Untagged geoset metadata, always glued to the end of the matrix list.
+            mesh.material_id = r.getf('<i')[0]
+            mesh.selection_group = r.getf('<I')[0]
+            mesh.selection_flags = r.getf('<I')[0]
+            r.skip(28)    # default bounds
+            extentsCount = r.getf('<I')[0]
+            r.skip(min(28 * extentsCount, dataSize - r.offset))
+        elif chunkId == constants.CHUNK_TEXTURE_VERTEX_GROUP:
+            pass    # number of uv sets; the sets themselves follow as UVBS
+        elif chunkId == constants.CHUNK_VERTEX_TEXTURE_POSITION:
+            uvList = []
+            for _ in range(count):
+                u, v = r.getf('<2f')
+                uvList.append((u, 1.0 - v))
+            mesh.uv_sets.append(uvList)
+            if not mesh.uvs:
+                mesh.uvs = uvList
+        else:
+            # Tagged sub-chunks carry no size field, so an unknown one cannot be skipped over.
+            print('[WarCraft 3] Unknown geoset sub-chunk "{0}"; the rest of this geoset is skipped.'.format(chunkId))
+            break
     vertexGroups, vertexGroupsIds = get_vertex_groups(matrixGroups, matrixGroupsSizes, matrixIndices)
     mesh.vertex_groups = vertexGroups
     mesh.vertex_groups_ids = vertexGroupsIds
-    mesh.material_id = r.getf('<I')[0]
-    selectionGroup = r.getf('<I')[0]
-    selectionFlags = r.getf('<I')[0]
-    mesh.selection_group = selectionGroup
-    mesh.selection_flags = selectionFlags
-    boundsRadius = r.getf('<f')[0]
-    minimumExtent = r.getf('<3f')
-    maximumExtent = r.getf('<3f')
-    extentsCount = r.getf('<I')[0]
-    for _ in range(extentsCount):
-        boundsRadius = r.getf('<f')[0]
-        minimumExtent = r.getf('<3f')
-        maximumExtent = r.getf('<3f')
-    ############################################################################
-    chunkId = r.getid(constants.CHUNK_TEXTURE_VERTEX_GROUP)
-    textureVertexGroupCount = r.getf('<I')[0]
-    num_uv_sets = max(textureVertexGroupCount, 1)
-    for uv_set_idx in range(num_uv_sets):
-        if r.offset + 8 > len(data):
-            break
-        try:
-            subId = r.getid(constants.CHUNK_VERTEX_TEXTURE_POSITION, debug=True)
-            if subId != constants.CHUNK_VERTEX_TEXTURE_POSITION:
-                r.offset -= 4
-                break
-            vertexTexturePositionCount = r.getf('<I')[0]
-            uv_list = []
-            for _ in range(vertexTexturePositionCount):
-                u, v = r.getf('<2f')
-                uv_list.append((u, 1.0 - v))
-            mesh.uv_sets.append(uv_list)
-            if uv_set_idx == 0:
-                mesh.uvs = uv_list
-        except Exception:
-            break
-    if not mesh.uvs and mesh.uv_sets:
-        mesh.uvs = mesh.uv_sets[0]
+    if faceTypes and any(faceType != 4 for faceType in faceTypes):
+        print('[WarCraft 3] Geoset "{0}" uses face types {1}; only 4 (triangle list) is '
+              'supported, strip/fan indices are read as triangles.'.format(mesh.name, faceTypes))
     ############################################################################
     return mesh
 
@@ -518,12 +489,12 @@ def parse_geoset_animations(data, model):
         inclusiveSize = r.offset + r.getf('<I')[0]
         alpha = r.getf('<f')[0]
         flags = r.getf('<I')[0]
-        bgr = r.getf('<3f')
-        rgb = (bgr[2], bgr[1], bgr[0])  # MDX geoset color is BGR -> RGB
+        # GEOA static color is already RGB; only the animated KGAC track is BGR.
+        color = r.getf('<3f')
         geosetAnimation.geoset_id = r.getf('<I')[0]
         geosetAnimation.alpha = alpha
         geosetAnimation.flags = flags
-        geosetAnimation.color = rgb
+        geosetAnimation.color = color
         while r.offset < inclusiveSize:
             chunkId = r.getid()
             if chunkId == constants.CHUNK_GEOSET_COLOR:
@@ -540,7 +511,7 @@ def parse_geoset_animations(data, model):
             geosetColor.tracks_count = 1
             geosetColor.interpolation_type = constants.INTERPOLATION_TYPE_NONE
             geosetColor.times = [0, ]
-            geosetColor.values = [rgb, ]
+            geosetColor.values = [color, ]
             geosetAnimation.animation_color = geosetColor
         if not geosetAnimation.animation_alpha:
             geosetAlpha = classes.WarCraft3GeosetTransformation()
@@ -694,8 +665,8 @@ def parse_particle_emitters_2(data, model):
         emitter.gravity = r.getf('<f')[0]
         emitter.life_span = r.getf('<f')[0]
         emitter.emission_rate = r.getf('<f')[0]
-        emitter.width = r.getf('<f')[0]
         emitter.length = r.getf('<f')[0]
+        emitter.width = r.getf('<f')[0]
         emitter.filter_mode = r.getf('<I')[0]
         emitter.rows = r.getf('<I')[0]
         emitter.columns = r.getf('<I')[0]
@@ -818,12 +789,13 @@ def parse_mdx(data, importProperties):
 
 
 def load_mdx(importProperties):
+    """Load a WarCraft 3 model: binary .mdx, or the text .mdl form of the same data."""
     mdxPath = importProperties.mdx_file_path
-    if mdxPath.lower().endswith('.mdl'):
-        raise Exception(
-            '"{0}" is a .mdl (text format) file. This addon imports the binary '
-            '.mdx format only - convert the model to .mdx with Retera Model '
-            'Studio (File > Save As) and try again.'.format(os.path.basename(mdxPath)))
     with open(mdxPath, 'rb') as mdxFile:
         mdxFileData = mdxFile.read()
+    if mdxFileData[:4] != b'MDLX':
+        if b'\x00' in mdxFileData[:64]:
+            raise Exception('"{0}" is not a WarCraft 3 model: missing the MDLX header.'.format(
+                os.path.basename(mdxPath)))
+        return importer.load_warcraft_3_model(mdl.parse_mdl(mdxFileData), importProperties)
     return parse_mdx(mdxFileData, importProperties)
