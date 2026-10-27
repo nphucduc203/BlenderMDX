@@ -81,20 +81,14 @@ def glb_stats(path):
 
 
 def export_models():
-    """Run both tiers into a temp dir; a raise or a CANCELLED result fails the test."""
-    for mode, op in (('lossless', bpy.ops.warcraft_3.export_lossless_glb),
-                     ('compatible', bpy.ops.warcraft_3.export_compatible_glb)):
-        path = os.path.join(tempfile.gettempdir(), f'wc3_smoke_{mode}.glb')
-        result = op(filepath=path)
-        assert result == {'FINISHED'}, f'{mode} export returned {result}'
-        print(f'{mode:<11}:', glb_stats(path))
-        sidecar = path[:-4] + '.wc3.json'
-        if os.path.exists(sidecar):
-            with open(sidecar, encoding='utf-8') as f:
-                print(f'{mode:<11} sidecar:', {k: len(v) for k, v in json.load(f).items() if isinstance(v, list)})
-        # The exporters must leave the scene exactly as they found it.
-        leftovers = [m.name for m in bpy.data.materials if 'W3_Export' in m.name or m.name.endswith('.tmp')]
-        assert not leftovers, f'{mode} export left temp materials: {leftovers}'
+    """Run the engine exporter into a temp dir; a raise or a CANCELLED result fails the test."""
+    path = os.path.join(tempfile.gettempdir(), 'wc3_smoke.glb')
+    result = bpy.ops.warcraft_3.export_glb(filepath=path)
+    assert result == {'FINISHED'}, f'export returned {result}'
+    print('export      :', glb_stats(path))
+    # The exporters must leave the scene exactly as they found it.
+    leftovers = [m.name for m in bpy.data.materials if 'W3_Export' in m.name or m.name.endswith('.tmp')]
+    assert not leftovers, f'export left temp materials: {leftovers}'
     return 0
 
 

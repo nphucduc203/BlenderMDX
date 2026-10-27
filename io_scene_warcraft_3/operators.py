@@ -16,7 +16,7 @@ JSON_CHUNK_TYPE = 0x4E4F534A  # b'JSON'
 BIN_CHUNK_TYPE = 0x004E4942   # b'BIN\x00'
 
 
-def postprocess_wc3_glb(glb_path, use_khr_emissive_strength=True):
+def postprocess_wc3_glb(glb_path, keep_animations=None, use_khr_emissive_strength=True):
     """
     Open an exported .glb file, parse its JSON chunk, enforce exact glTF 2.0 material
     properties (`alphaMode`, `alphaCutoff`, `doubleSided`, `pbrMetallicRoughness`,
@@ -51,6 +51,10 @@ def postprocess_wc3_glb(glb_path, use_khr_emissive_strength=True):
 
     if json_obj is None or json_chunk_idx < 0:
         return False
+
+    if keep_animations is not None:
+        json_obj['animations'] = [a for a in json_obj.get('animations', [])
+                                  if a.get('name') in keep_animations]
 
     extensions_used = set(json_obj.get('extensionsUsed', []))
     materials = json_obj.get('materials', [])
@@ -116,33 +120,20 @@ def postprocess_wc3_glb(glb_path, use_khr_emissive_strength=True):
             mat['alphaMode'] = 'BLEND'
             mat['doubleSided'] = True
             mat.pop('alphaCutoff', None)
-            mode = extras.get('wc3_mode', 'lossless')
-            if mode == 'compatible':
-                pbr['baseColorFactor'] = [0.0, 0.0, 0.0, 1.0]
-                if tex_info:
-                    mat['emissiveTexture'] = dict(tex_info)
-                mat['emissiveFactor'] = [1.0, 1.0, 1.0]
-                if use_khr_emissive_strength:
-                    strength = 2.0
-                    if layer_alpha < 0.9:
-                        strength = min(3.5, 1.0 / max(layer_alpha, 0.1))
-                    ext = mat.setdefault('extensions', {})
-                    ext['KHR_materials_emissive_strength'] = {'emissiveStrength': float(strength)}
-                    extensions_used.add('KHR_materials_emissive_strength')
-            else: # lossless: retain exact tint and layer alpha
-                pbr['baseColorFactor'] = [
-                    float(tint[0]),
-                    float(tint[1]),
-                    float(tint[2]),
-                    float(layer_alpha)
-                ]
-                if tex_info:
-                    mat['emissiveTexture'] = dict(tex_info)
-                mat['emissiveFactor'] = [1.0, 1.0, 1.0]
-                if use_khr_emissive_strength:
-                    ext = mat.setdefault('extensions', {})
-                    ext['KHR_materials_emissive_strength'] = {'emissiveStrength': 1.0}
-                    extensions_used.add('KHR_materials_emissive_strength')
+            # Additive layer: exact tint and layer alpha ride on baseColorFactor, the texture on emission.
+            pbr['baseColorFactor'] = [
+                float(tint[0]),
+                float(tint[1]),
+                float(tint[2]),
+                float(layer_alpha)
+            ]
+            if tex_info:
+                mat['emissiveTexture'] = dict(tex_info)
+            mat['emissiveFactor'] = [1.0, 1.0, 1.0]
+            if use_khr_emissive_strength:
+                ext = mat.setdefault('extensions', {})
+                ext['KHR_materials_emissive_strength'] = {'emissiveStrength': 1.0}
+                extensions_used.add('KHR_materials_emissive_strength')
         elif filter_mode in (5, 6):
             mat['alphaMode'] = 'BLEND'
             mat['doubleSided'] = True
@@ -433,13 +424,34 @@ class WarCraft3OperatorPushToNLA(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def _flatten_wc3_material_lossless(src, obj_color=(1.0, 1.0, 1.0, 1.0)):
+def _additive_mask_image(img):
+    """Copy `img` with alpha replaced by its own luminance.
+
+    glTF has no additive mode, and a WarCraft 3 additive layer ignores its alpha channel
+    (it is usually opaque black outside the glow). Without this an engine that only knows
+    alpha blending paints those dark regions over the scene instead of adding light.
+    """
+    name = img.name + '_addmask'
+    derived = bpy.data.images.get(name)
+    if derived is not None:
+        return derived
+    width, height = max(int(img.size[0]), 1), max(int(img.size[1]), 1)
+    derived = bpy.data.images.new(name, width, height, alpha=True)
+    derived.colorspace_settings.name = img.colorspace_settings.name
+    src = img.pixels[:]
+    rgba = list(zip(src[0::4], src[1::4], src[2::4]))
+    derived.pixels[:] = [value for r, g, b in rgba
+                         for value in (r, g, b, min(r * 0.299 + g * 0.587 + b * 0.114, 1.0))]
+    return derived
+
+
+def _flatten_wc3_material(src, obj_color=(1.0, 1.0, 1.0, 1.0)):
     """
     Build a Lossless glTF material preserving exact WC3 data in `extras`:
     - Base Color = texture (tinted if obj_color is not white)
     - Alpha = texture.Alpha * layer_alpha (NO SQUARING, NO FAKE ALPHA!)
     - Emission Color = texture.Color with strength 1.0 for additive/unshaded
-    - `extras`: full WC3 parameters (wc3_mode='lossless', wc3_blend, wc3_filter_mode, wc3_layer_alpha, wc3_tint, wc3_unshaded, wc3_two_sided)
+    - `extras`: full WC3 parameters (wc3_blend, wc3_filter_mode, wc3_layer_alpha, wc3_tint, wc3_unshaded, wc3_two_sided)
     """
     if not src or not src.use_nodes:
         return None
@@ -481,7 +493,7 @@ def _flatten_wc3_material_lossless(src, obj_color=(1.0, 1.0, 1.0, 1.0)):
         bsdf.inputs['Specular IOR Level'].default_value = 0.0
 
     tex = fn.new('ShaderNodeTexImage')
-    tex.image = img
+    tex.image = _additive_mask_image(img) if is_additive else img
     tex.location = (-350, 0)
 
     tint_rgb = (float(obj_color[0]), float(obj_color[1]), float(obj_color[2]))
@@ -532,7 +544,6 @@ def _flatten_wc3_material_lossless(src, obj_color=(1.0, 1.0, 1.0, 1.0)):
         if hasattr(flat, 'blend_method'): flat.blend_method = 'CLIP'
         if hasattr(flat, 'alpha_threshold'): flat.alpha_threshold = 0.5
 
-    flat['wc3_mode'] = 'lossless'
     flat['wc3_layer_index'] = 0
     flat['wc3_filter_mode'] = int(filter_mode)
     flat['wc3_blend'] = importer.FILTER_MODE_NAMES.get(filter_mode, 'additive' if is_additive else 'blend')
@@ -543,7 +554,7 @@ def _flatten_wc3_material_lossless(src, obj_color=(1.0, 1.0, 1.0, 1.0)):
     return flat
 
 
-def _flatten_wc3_sec_layer_lossless(tex_img, sec_info, obj_color, mat_name="GLTF_Sec"):
+def _flatten_wc3_sec_layer(tex_img, sec_info, obj_color, mat_name="GLTF_Sec"):
     """Build a glTF material for a secondary material layer (layer > 1) in lossless mode."""
     flat = bpy.data.materials.new(mat_name)
     flat.use_nodes = True
@@ -559,13 +570,14 @@ def _flatten_wc3_sec_layer_lossless(tex_img, sec_info, obj_color, mat_name="GLTF
     if 'Metallic' in bsdf.inputs: bsdf.inputs['Metallic'].default_value = 0.0
     if 'Specular IOR Level' in bsdf.inputs: bsdf.inputs['Specular IOR Level'].default_value = 0.0
 
+    filter_mode = int(sec_info.get('filter_mode', 3))
+
     tex = fn.new('ShaderNodeTexImage')
-    tex.image = tex_img
+    tex.image = _additive_mask_image(tex_img) if filter_mode in (3, 4) else tex_img
     tex.location = (-350, 0)
 
     fl.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
 
-    filter_mode = int(sec_info.get('filter_mode', 3))
     sec_alpha = float(sec_info.get('alpha', 1.0))
     obj_a = float(obj_color[3]) if len(obj_color) > 3 else 1.0
     effective_alpha = sec_alpha * obj_a
@@ -592,7 +604,6 @@ def _flatten_wc3_sec_layer_lossless(tex_img, sec_info, obj_color, mat_name="GLTF
     if hasattr(flat, 'blend_method'): flat.blend_method = 'BLEND'
     if hasattr(flat, 'surface_render_method'): flat.surface_render_method = 'BLENDED'
 
-    flat['wc3_mode'] = 'lossless'
     flat['wc3_layer_index'] = int(sec_info.get('layer_index', 1))
     flat['wc3_filter_mode'] = filter_mode
     flat['wc3_blend'] = importer.FILTER_MODE_NAMES.get(filter_mode, 'additive' if is_additive else 'blend')
@@ -600,134 +611,6 @@ def _flatten_wc3_sec_layer_lossless(tex_img, sec_info, obj_color, mat_name="GLTF
     flat['wc3_tint'] = [float(obj_color[0]), float(obj_color[1]), float(obj_color[2]), float(effective_alpha)]
     flat['wc3_unshaded'] = bool(is_unshaded)
     flat['wc3_two_sided'] = bool(sec_info.get('two_sided', True))
-    return flat
-
-
-def _flatten_wc3_material_compatible(src, obj_color=(1.0, 1.0, 1.0, 1.0)):
-    """
-    Build a standard PBR glTF material using frozen approximation formulas:
-    - Additive semi-transparent (layerAlpha < 0.9): alpha = texAlpha * layerAlpha^2, boosted emission
-    - Additive full-alpha: luminance-gated alpha, emission = 0.3
-    - Base Color black for additive to prevent diffuse lighting washes
-    """
-    if not src or not src.use_nodes:
-        return None
-    nodes = src.node_tree.nodes
-    img = None
-    for n in nodes:
-        if n.type == 'TEX_IMAGE' and n.image:
-            img = n.image
-            break
-    if img is None:
-        return None
-
-    filter_mode = src.get('wc3_filter_mode', None)
-    if filter_mode is None:
-        has_add = any(n.type == 'ADD_SHADER' for n in nodes)
-        has_bsdf = any(n.type == 'BSDF_PRINCIPLED' for n in nodes)
-        if has_add and not has_bsdf:
-            filter_mode = 3
-        elif getattr(src, 'blend_method', '') == 'CLIP':
-            filter_mode = 1
-        elif getattr(src, 'blend_method', '') == 'BLEND' or getattr(src, 'surface_render_method', '') == 'BLENDED':
-            filter_mode = 2
-        else:
-            filter_mode = 0
-
-    unshaded = bool(src.get('wc3_unshaded', False))
-    two_sided = bool(src.get('wc3_two_sided', not src.use_backface_culling))
-    is_additive = filter_mode in (3, 4)
-
-    flat = bpy.data.materials.new('GLTF_' + src.name)
-    flat.use_nodes = True
-    fn = flat.node_tree.nodes
-    fl = flat.node_tree.links
-    fn.clear()
-
-    out = fn.new('ShaderNodeOutputMaterial')
-    out.location = (400, 0)
-    bsdf = fn.new('ShaderNodeBsdfPrincipled')
-    bsdf.location = (100, 0)
-    if 'Roughness' in bsdf.inputs: bsdf.inputs['Roughness'].default_value = 0.8
-    if 'Metallic' in bsdf.inputs: bsdf.inputs['Metallic'].default_value = 0.0
-    if 'Specular IOR Level' in bsdf.inputs: bsdf.inputs['Specular IOR Level'].default_value = 0.0
-
-    tex = fn.new('ShaderNodeTexImage')
-    tex.image = img
-    tex.location = (-350, 0)
-
-    tint_rgb = (float(obj_color[0]), float(obj_color[1]), float(obj_color[2]))
-    obj_a = float(obj_color[3]) if len(obj_color) > 3 else 1.0
-
-    is_tinted = abs(tint_rgb[0] - 1.0) + abs(tint_rgb[1] - 1.0) + abs(tint_rgb[2] - 1.0) > 0.01
-    color_out = tex.outputs['Color']
-    if is_tinted:
-        mix = fn.new('ShaderNodeMix')
-        mix.data_type = 'RGBA'
-        mix.blend_type = 'MULTIPLY'
-        mix.inputs[6].default_value = (tint_rgb[0], tint_rgb[1], tint_rgb[2], 1.0)
-        fl.new(tex.outputs['Color'], mix.inputs[7])
-        color_out = mix.outputs[2]
-
-    if is_additive:
-        black = fn.new('ShaderNodeMix')
-        black.data_type = 'RGBA'
-        black.blend_type = 'MULTIPLY'
-        black.inputs[6].default_value = (0.0, 0.0, 0.0, 1.0)
-        fl.new(color_out, black.inputs[7])
-        fl.new(black.outputs[2], bsdf.inputs['Base Color'])
-    else:
-        fl.new(color_out, bsdf.inputs['Base Color'])
-
-    # Approximation alpha
-    if is_additive and obj_a < 0.9:
-        mul = fn.new('ShaderNodeMath')
-        mul.operation = 'MULTIPLY'
-        mul.use_clamp = True
-        fl.new(tex.outputs['Alpha'], mul.inputs[0])
-        mul.inputs[1].default_value = obj_a * obj_a
-        fl.new(mul.outputs['Value'], bsdf.inputs['Alpha'])
-    elif is_additive:
-        bw = fn.new('ShaderNodeRGBToBW')
-        mul = fn.new('ShaderNodeMath')
-        mul.operation = 'MULTIPLY'
-        mul.use_clamp = True
-        fl.new(tex.outputs['Color'], bw.inputs['Color'])
-        fl.new(bw.outputs['Val'], mul.inputs[0])
-        fl.new(tex.outputs['Alpha'], mul.inputs[1])
-        fl.new(mul.outputs['Value'], bsdf.inputs['Alpha'])
-    elif filter_mode == 1:
-        rnd = fn.new('ShaderNodeMath')
-        rnd.operation = 'ROUND'
-        fl.new(tex.outputs['Alpha'], rnd.inputs[0])
-        fl.new(rnd.outputs['Value'], bsdf.inputs['Alpha'])
-    else:
-        fl.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
-
-    # Emission
-    if unshaded or is_additive:
-        strength = 0.3
-        if is_additive and obj_a < 0.9:
-            strength = min(3.5, 1.0 / max(obj_a, 0.1))
-        fl.new(tex.outputs['Color'], bsdf.inputs['Emission Color'])
-        bsdf.inputs['Emission Strength'].default_value = strength
-
-    fl.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
-    flat.use_backface_culling = False if (two_sided or is_additive) else True
-    if is_additive or filter_mode in (2, 5, 6):
-        if hasattr(flat, 'blend_method'): flat.blend_method = 'BLEND'
-        if hasattr(flat, 'surface_render_method'): flat.surface_render_method = 'BLENDED'
-    elif filter_mode == 1:
-        if hasattr(flat, 'blend_method'): flat.blend_method = 'CLIP'
-        if hasattr(flat, 'alpha_threshold'): flat.alpha_threshold = 0.5
-
-    flat['wc3_mode'] = 'compatible'
-    flat['wc3_blend'] = importer.FILTER_MODE_NAMES.get(filter_mode, 'additive' if is_additive else 'blend')
-    flat['wc3_filter_mode'] = int(filter_mode)
-    flat['wc3_layer_alpha'] = float(obj_a)
-    flat['wc3_tint'] = [float(tint_rgb[0]), float(tint_rgb[1]), float(tint_rgb[2]), float(obj_a)]
-    flat['wc3_unshaded'] = bool(unshaded or is_additive)
-    flat['wc3_two_sided'] = bool(two_sided or is_additive)
     return flat
 
 
@@ -789,7 +672,7 @@ def _is_blender_obj_outline_shell(obj):
     return False
 
 
-def _prepare_lossless_export_meshes(context, arm, export_set):
+def _prepare_export_meshes(context, arm, export_set):
     """
     Industry-standard Lossless export preparation:
     1. Emitters -> Empty markers parented to bones with full particle extras.
@@ -838,7 +721,7 @@ def _prepare_lossless_export_meshes(context, arm, export_set):
         key0 = (src.name, "L0", round(col[0], 3), round(col[1], 3), round(col[2], 3), round(col[3], 3))
         flat0 = by_key.get(key0)
         if flat0 is None:
-            flat0 = _flatten_wc3_material_lossless(src, col)
+            flat0 = _flatten_wc3_material(src, col)
             by_key[key0] = flat0
             if flat0:
                 temp_materials.append(flat0)
@@ -864,7 +747,7 @@ def _prepare_lossless_export_meshes(context, arm, export_set):
                 sec_key = (src.name, f"L{sec_idx}", sec_img.name, round(col[0], 3), round(col[1], 3), round(col[2], 3))
                 sec_flat = by_key.get(sec_key)
                 if sec_flat is None:
-                    sec_flat = _flatten_wc3_sec_layer_lossless(sec_img, sec_info, col, mat_name=f"GLTF_{src.name}_L{sec_idx}")
+                    sec_flat = _flatten_wc3_sec_layer(sec_img, sec_info, col, mat_name=f"GLTF_{src.name}_L{sec_idx}")
                     by_key[sec_key] = sec_flat
                     if sec_flat:
                         temp_materials.append(sec_flat)
@@ -892,41 +775,8 @@ def _prepare_lossless_export_meshes(context, arm, export_set):
     return swaps, temp_materials, temp_meshes, temp_empties
 
 
-def _prepare_compatible_export_meshes(context, arm, export_set):
-    """
-    Standard Vanilla PBR export:
-    - Pure character model ONLY: NO emitters, NO particle markers, NO emitter textures.
-    - Uses frozen approximation formulas (layerAlpha², luminance gating) for basic PBR viewers.
-    """
-    swaps = []
-    temp_materials = []
-    temp_empties = []
-    by_key = {}
-
-    for obj in list(export_set):
-        if obj.type != 'MESH':
-            continue
-        for i, slot in enumerate(obj.material_slots):
-            src = slot.material
-            if not src or not src.use_nodes:
-                continue
-            col = tuple(obj.color) if hasattr(obj, 'color') else (1.0, 1.0, 1.0, 1.0)
-            key = (src.name, "compat", round(col[0], 3), round(col[1], 3), round(col[2], 3), round(col[3], 3))
-            flat = by_key.get(key)
-            if flat is None:
-                flat = _flatten_wc3_material_compatible(src, col)
-                by_key[key] = flat
-                if flat:
-                    temp_materials.append(flat)
-            if flat:
-                slot.material = flat
-                swaps.append((obj, i, src))
-
-    return swaps, temp_materials, temp_empties
-
-
-def _export_glb_core(operator, context, mode="lossless"):
-    print(f"[_export_glb_core] mode={mode} filepath='{operator.filepath}'")
+def _export_glb_core(operator, context):
+    print(f"[_export_glb_core] filepath='{operator.filepath}'")
     arm = find_scene_armature(context)
     if not arm:
         operator.report({'ERROR'}, "No Armature found in scene to export")
@@ -972,15 +822,16 @@ def _export_glb_core(operator, context, mode="lossless"):
     temp_meshes = []
     temp_empties = []
 
-    if mode == "lossless":
-        swaps, temp_materials, temp_meshes, temp_empties = _prepare_lossless_export_meshes(context, arm, export_set)
-    else:
-        swaps, temp_materials, temp_empties = _prepare_compatible_export_meshes(context, arm, export_set)
+    swaps, temp_materials, temp_meshes, temp_empties = _prepare_export_meshes(context, arm, export_set)
 
     bpy.ops.object.select_all(action='DESELECT')
     for obj in export_set:
         obj.select_set(True)
     context.view_layer.objects.active = arm
+
+    # ACTIONS mode exports every action in the .blend, including sequences of other
+    # models in the file, so keep only the ones tagged for the armature being exported.
+    keep_animations = [a.name for a in bpy.data.actions if a.get('wc3_armature_name') == arm.name]
 
     try:
         bpy.ops.export_scene.gltf(
@@ -996,8 +847,9 @@ def _export_glb_core(operator, context, mode="lossless"):
             export_apply=False,
             export_extras=True,
         )
-        postprocess_wc3_glb(operator.filepath, use_khr_emissive_strength=True)
-        operator.report({'INFO'}, f"Successfully exported GLB ({mode}): {os.path.basename(operator.filepath)}")
+        postprocess_wc3_glb(operator.filepath, keep_animations=keep_animations,
+                            use_khr_emissive_strength=True)
+        operator.report({'INFO'}, f"Successfully exported GLB: {os.path.basename(operator.filepath)}")
         result = {'FINISHED'}
     except Exception as e:
         operator.report({'ERROR'}, f"Failed to export GLB: {e}")
@@ -1028,14 +880,19 @@ def _export_glb_core(operator, context, mode="lossless"):
                 bpy.data.objects.remove(empty, do_unlink=True)
             except Exception:
                 pass
+        for img in [i for i in bpy.data.images if i.name.endswith('_addmask') and i.users == 0]:
+            try:
+                bpy.data.images.remove(img)
+            except Exception:
+                pass
 
     return result
 
 
-class WARCRAFT_3_OT_export_lossless_glb(bpy.types.Operator, io_utils.ExportHelper):
-    bl_idname = 'warcraft_3.export_lossless_glb'
-    bl_label = 'Export Lossless GLB (WC3 Extensions)'
-    bl_description = 'Export model with multi-primitive layers and lossless WC3 metadata in glTF extras for Game Engines (Godot, Unity, Unreal)'
+class WARCRAFT_3_OT_export_glb(bpy.types.Operator, io_utils.ExportHelper):
+    bl_idname = 'warcraft_3.export_glb'
+    bl_label = 'WarCraft 3 (.glb)'
+    bl_description = 'Export one engine-ready glTF 2.0 file: per-layer primitives, PBR emissive glow, every animation sequence and emitter marker nodes for Godot, Unity and Unreal'
     bl_options = {'UNDO'}
 
     filename_ext = '.glb'
@@ -1069,111 +926,7 @@ class WARCRAFT_3_OT_export_lossless_glb(bpy.types.Operator, io_utils.ExportHelpe
     )
 
     def execute(self, context):
-        return _export_glb_core(self, context, mode="lossless")
-
-    def invoke(self, context, event):
-        arm = find_scene_armature(context)
-        if arm:
-            safe_name = "".join(c for c in arm.name.replace(' Nodes', '') if c.isalnum() or c in ('_', '-'))
-            if not safe_name:
-                safe_name = "warcraft_model"
-            self.filepath = safe_name + "_lossless.glb"
-        return super().invoke(context, event)
-
-
-WarCraft3OperatorExportLosslessGLB = WARCRAFT_3_OT_export_lossless_glb
-
-
-class WARCRAFT_3_OT_export_compatible_glb(bpy.types.Operator, io_utils.ExportHelper):
-    bl_idname = 'warcraft_3.export_compatible_glb'
-    bl_label = 'Export Compatible GLB (Standard PBR)'
-    bl_description = 'Export model as standard glTF PBR compatible with all 3D viewers (uses approximation: layerAlpha² & boosted emission)'
-    bl_options = {'UNDO'}
-
-    filename_ext = '.glb'
-    filter_glob: bpy.props.StringProperty(default='*.glb', options={'HIDDEN'})
-    filepath: bpy.props.StringProperty(name='File Path', maxlen=1024, default='')
-
-    exportAllActions: bpy.props.BoolProperty(
-        name='Export All Animation Sequences',
-        description='Export all model sequences as separate animations for Godot AnimationPlayer & Blender',
-        default=True
-    )
-    skipStackedHaloClouds: bpy.props.BoolProperty(
-        name='Exclude Stacked Additive Halo Quads',
-        description='Exclude Geosets composed of dozens of intersecting Additive Halo Quads',
-        default=True
-    )
-    skipOutlineShells: bpy.props.BoolProperty(
-        name='Exclude Inverted-Hull Rim Shells',
-        description='Exclude inverted-hull toon outline shell Geosets',
-        default=True
-    )
-    skipHiddenSpellMeshes: bpy.props.BoolProperty(
-        name='Exclude Hidden / Unanimated Effect Meshes',
-        description='Exclude Geosets whose alpha is 0 across all animations',
-        default=True
-    )
-    exportCamerasAndLights: bpy.props.BoolProperty(
-        name='Export WC3 Portrait Cameras & Lights',
-        description='Include WarCraft 3 portrait camera and light objects in the exported .glb',
-        default=False
-    )
-
-    def execute(self, context):
-        return _export_glb_core(self, context, mode="compatible")
-
-    def invoke(self, context, event):
-        arm = find_scene_armature(context)
-        if arm:
-            safe_name = "".join(c for c in arm.name.replace(' Nodes', '') if c.isalnum() or c in ('_', '-'))
-            if not safe_name:
-                safe_name = "warcraft_model"
-            self.filepath = safe_name + "_compatible.glb"
-        return super().invoke(context, event)
-
-
-WarCraft3OperatorExportCompatibleGLB = WARCRAFT_3_OT_export_compatible_glb
-
-
-class WARCRAFT_3_OT_export_godot_glb(bpy.types.Operator, io_utils.ExportHelper):
-    bl_idname = 'warcraft_3.export_godot_glb'
-    bl_label = 'Export for Godot (.glb)'
-    bl_description = 'Export model with multi-primitive layers and lossless WC3 metadata in glTF extras for Godot Engine'
-    bl_options = {'UNDO'}
-
-    filename_ext = '.glb'
-    filter_glob: bpy.props.StringProperty(default='*.glb', options={'HIDDEN'})
-    filepath: bpy.props.StringProperty(name='File Path', maxlen=1024, default='')
-
-    exportAllActions: bpy.props.BoolProperty(
-        name='Export All Animation Sequences',
-        description='Export all model sequences as separate animations for Godot AnimationPlayer & Blender',
-        default=True
-    )
-    skipStackedHaloClouds: bpy.props.BoolProperty(
-        name='Exclude Stacked Additive Halo Quads',
-        description='Exclude Geosets composed of dozens of intersecting Additive Halo Quads',
-        default=False
-    )
-    skipOutlineShells: bpy.props.BoolProperty(
-        name='Exclude Inverted-Hull Rim Shells',
-        description='Exclude inverted-hull toon outline shell Geosets',
-        default=True
-    )
-    skipHiddenSpellMeshes: bpy.props.BoolProperty(
-        name='Exclude Hidden / Unanimated Effect Meshes',
-        description='Exclude Geosets whose alpha is 0 across all animations',
-        default=True
-    )
-    exportCamerasAndLights: bpy.props.BoolProperty(
-        name='Export WC3 Portrait Cameras & Lights',
-        description='Include WarCraft 3 portrait camera and light objects in the exported .glb',
-        default=False
-    )
-
-    def execute(self, context):
-        return _export_glb_core(self, context, mode="lossless")
+        return _export_glb_core(self, context)
 
     def invoke(self, context, event):
         arm = find_scene_armature(context)
@@ -1185,7 +938,7 @@ class WARCRAFT_3_OT_export_godot_glb(bpy.types.Operator, io_utils.ExportHelper):
         return super().invoke(context, event)
 
 
-WarCraft3OperatorExportGodotGLB = WARCRAFT_3_OT_export_godot_glb
+WarCraft3OperatorExportGLB = WARCRAFT_3_OT_export_glb
 
 
 class WarCraft3OperatorCleanBoneShapes(bpy.types.Operator):

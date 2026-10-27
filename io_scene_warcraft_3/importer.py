@@ -404,28 +404,27 @@ def is_stacked_additive_halo_cloud(model, geoset_idx):
     return False
 
 
+def _iter_action_fcurves(action):
+    """Blender <= 4.3 exposes action.fcurves; 4.4+ nests them under layers/strips/channelbags."""
+    if hasattr(action, 'fcurves'):
+        yield from action.fcurves
+        return
+    for layer in action.layers:
+        for strip in getattr(layer, 'strips', []):
+            for channelbag in getattr(strip, 'channelbags', []):
+                yield from getattr(channelbag, 'fcurves', [])
+
+
 def make_action_cyclic(action):
     if not action:
         return
-    if hasattr(action, 'fcurves'):
-        for fc in action.fcurves:
-            try:
-                mod = fc.modifiers.new('CYCLES')
-                mod.mode_after = 'REPEAT'
-                mod.mode_before = 'REPEAT'
-            except Exception:
-                pass
-    elif hasattr(action, 'layers'):
-        for layer in action.layers:
-            for strip in getattr(layer, 'strips', []):
-                for cb in getattr(strip, 'channelbags', []):
-                    for fc in getattr(cb, 'fcurves', []):
-                        try:
-                            mod = fc.modifiers.new('CYCLES')
-                            mod.mode_after = 'REPEAT'
-                            mod.mode_before = 'REPEAT'
-                        except Exception:
-                            pass
+    for fc in _iter_action_fcurves(action):
+        try:
+            mod = fc.modifiers.new('CYCLES')
+            mod.mode_after = 'REPEAT'
+            mod.mode_before = 'REPEAT'
+        except Exception:
+            pass
 
 
 def animate_texture_animations(model, bpyMaterials, frameTime):
@@ -460,10 +459,69 @@ def animate_texture_animations(model, bpyMaterials, frameTime):
                             node.inputs['Location'].default_value = (val[0], -val[1], val[2])
                             node.inputs['Location'].keyframe_insert('default_value', index=0, frame=frame)
                             node.inputs['Location'].keyframe_insert('default_value', index=1, frame=frame)
-                        if bpyMat.node_tree.animation_data:
-                            make_action_cyclic(bpyMat.node_tree.animation_data.action)
+                    if ta.scalings and ta.scalings.tracks_count > 0:
+                        # Mapping does scale then rotate about the midpoint, which is WC3's TXAN order.
+                        for k in range(ta.scalings.tracks_count):
+                            frame = round(ta.scalings.times[k] / frameTime, 2)
+                            scale = ta.scalings.values[k]
+                            node.inputs['Scale'].default_value = (scale[0], scale[1], 1.0)
+                            node.inputs['Scale'].keyframe_insert('default_value', index=0, frame=frame)
+                            node.inputs['Scale'].keyframe_insert('default_value', index=1, frame=frame)
+                    if bpyMat.node_tree.animation_data:
+                        make_action_cyclic(bpyMat.node_tree.animation_data.action)
                 except Exception as e:
                     print(f"[WarCraft 3] Error animating texture: {e}")
+
+
+def _record_alpha_node(model, material_index, layer_index, node_name):
+    """Map (material, layer) to its alpha multiplier node on the parsed model.
+
+    A team-color merge moves layer 1's alpha onto the node named _L0, so
+    animate_material_layers must not guess the node from the layer index.
+    Runtime attribute only: as a material property it would ride into glTF extras.
+    """
+    if model is None:
+        return
+    if not hasattr(model, 'alpha_node_map'):
+        model.alpha_node_map = {}
+    model.alpha_node_map.setdefault(material_index, {})[layer_index] = node_name
+
+
+def animate_material_layers(model, bpyMaterials, frameTime):
+    """Bake KMTA layer alpha tracks. A KMTA key replaces the static layer alpha, it never multiplies it.
+
+    KMTF (flipbook texture index) is not baked: Blender 5.2 refuses to keyframe an image
+    node's 'image' property, so such layers keep the texture of their first key.
+    """
+    for mat_idx, bpyMat in enumerate(bpyMaterials):
+        if not bpyMat or not bpyMat.node_tree or mat_idx >= len(model.materials):
+            continue
+        node_tree = bpyMat.node_tree
+        alpha_nodes = getattr(model, 'alpha_node_map', {}).get(mat_idx, {})
+        animated = set()
+        for layer_idx, layer in enumerate(model.materials[mat_idx].layers):
+            track = layer.material_alpha
+            if not (track and track.times):
+                continue
+            nodeName = alpha_nodes.get(layer_idx)
+            alpha_node = node_tree.nodes.get(nodeName) if nodeName else None
+            if not alpha_node or alpha_node.name in animated:
+                # shortcut: a team-color merge shares one alpha multiplier for two layers; first track wins.
+                continue
+            animated.add(alpha_node.name)
+            socket = alpha_node.inputs[1]
+            for key_index, time_ms in enumerate(track.times):
+                socket.default_value = float(track.values[key_index])
+                socket.keyframe_insert('default_value', frame=round(time_ms / frameTime, 2))
+            interpolation = constants.INTERPOLATION_TYPE_NAMES.get(track.interpolation_type, 'LINEAR')
+            action = node_tree.animation_data.action if node_tree.animation_data else None
+            if not action:
+                continue
+            dataPath = 'nodes["{0}"].inputs[1].default_value'.format(alpha_node.name)
+            for fc in _iter_action_fcurves(action):
+                if fc.data_path == dataPath:
+                    for point in fc.keyframe_points:
+                        point.interpolation = interpolation
 
 
 def purge_orphaned_wc3_actions():
@@ -904,6 +962,7 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None, t
 
         if tex0:
             tex_node = nodes.new('ShaderNodeTexImage')
+            tex_node.name = f"LayerImage_Mat{material_index}_L0"
             tex_node.image = tex0
             tex_node.location = (-350, 0)
 
@@ -931,13 +990,16 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None, t
             links.new(tex_node.outputs['Alpha'], math_a.inputs[0])
             links.new(obj_info.outputs['Alpha'], math_a.inputs[1])
 
-            if layer0.alpha < 0.999:
+            # A KMTA track replaces the static layer alpha, so it needs the multiplier node even at alpha 1.
+            if layer0.alpha < 0.999 or layer0.material_alpha:
                 math_layer_a = nodes.new('ShaderNodeMath')
+                math_layer_a.name = f"LayerAlpha_Mat{material_index}_L0"
                 math_layer_a.operation = 'MULTIPLY'
                 math_layer_a.location = (50, 150)
                 links.new(math_a.outputs['Value'], math_layer_a.inputs[0])
                 math_layer_a.inputs[1].default_value = layer0.alpha
                 links.new(math_layer_a.outputs['Value'], emis_node.inputs['Strength'])
+                _record_alpha_node(model, material_index, 0, math_layer_a.name)
             else:
                 links.new(math_a.outputs['Value'], emis_node.inputs['Strength'])
         else:
@@ -1010,6 +1072,7 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None, t
 
     if tex0:
         tex_node_0 = nodes.new('ShaderNodeTexImage')
+        tex_node_0.name = f"LayerImage_Mat{material_index}_L0"
         tex_node_0.image = tex0
         tex_node_0.location = (-350, 100)
 
@@ -1040,13 +1103,15 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None, t
             links.new(tex_node_0.outputs['Alpha'], math_alpha.inputs[0])
             links.new(obj_info.outputs['Alpha'], math_alpha.inputs[1])
 
-            if effective_layer0.alpha < 0.999:
+            if effective_layer0.alpha < 0.999 or effective_layer0.material_alpha:
                 math_layer_a = nodes.new('ShaderNodeMath')
+                math_layer_a.name = f"LayerAlpha_Mat{material_index}_L0"
                 math_layer_a.operation = 'MULTIPLY'
                 math_layer_a.location = (100, -150)
                 links.new(math_alpha.outputs['Value'], math_layer_a.inputs[0])
                 math_layer_a.inputs[1].default_value = effective_layer0.alpha
                 links.new(math_layer_a.outputs['Value'], bsdf.inputs['Alpha'])
+                _record_alpha_node(model, material_index, 0 if effective_layer0 is layer0 else 1, math_layer_a.name)
             else:
                 links.new(math_alpha.outputs['Value'], bsdf.inputs['Alpha'])
 
@@ -1063,6 +1128,7 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None, t
 
         loc_y = -350 - 250 * (layer_idx - 1)
         tex_node = nodes.new('ShaderNodeTexImage')
+        tex_node.name = f"LayerImage_Mat{material_index}_L{layer_idx}"
         tex_node.image = tex
         tex_node.location = (-350, loc_y)
 
@@ -1098,11 +1164,13 @@ def create_warcraft3_material(material, material_index, bpyImages, model=None, t
             links.new(obj_info.outputs['Alpha'], math_a.inputs[1])
 
             scale_a = nodes.new('ShaderNodeMath')
+            scale_a.name = f"LayerAlpha_Mat{material_index}_L{layer_idx}"
             scale_a.operation = 'MULTIPLY'
             scale_a.location = (250, loc_y)
             links.new(math_a.outputs['Value'], scale_a.inputs[0])
             scale_a.inputs[1].default_value = layer.alpha
             links.new(scale_a.outputs['Value'], sec_emis_node.inputs['Strength'])
+            _record_alpha_node(model, material_index, layer_idx, scale_a.name)
 
             links.new(curr_surface_output, add_shader.inputs[0])
             links.new(sec_emis_node.outputs['Emission'], add_shader.inputs[1])
@@ -1801,6 +1869,7 @@ def load_warcraft_3_model(model, importProperties):
 
     bpyMaterials = getattr(model, 'bpy_materials', [])
     animate_texture_animations(model, bpyMaterials, importProperties.frame_time)
+    animate_material_layers(model, bpyMaterials, importProperties.frame_time)
 
     if hasattr(importProperties, 'global_scale'):
         s = importProperties.global_scale

@@ -1,7 +1,7 @@
 # BlenderMDX - Agent Guidelines
 
 ## Overview
-BlenderMDX is a high-performance Blender addon (**Blender 4.2 - 5.2 LTS**) to import WarCraft 3 models (`.mdx`), textures (`.blp`), particle systems, and animation sequences, plus a 2-tier `.glb` exporter for game engines (Godot, Unity, Unreal). The repository also includes standalone Godot 4 post-import tools and an editor addon.
+BlenderMDX is a high-performance Blender addon (**Blender 4.2 - 5.2 LTS**) to import WarCraft 3 models (`.mdx` binary and `.mdl` text), textures (`.blp`), particle systems, and animation sequences, plus a single engine-ready `.glb` exporter (standard glTF 2.0 with `wc3_*` extras).
 
 ---
 
@@ -11,16 +11,13 @@ BlenderMDX is a high-performance Blender addon (**Blender 4.2 - 5.2 LTS**) to im
   - `blender_manifest.toml`: Extension manifest required by Blender 4.2+ extensions platform.
   - `parser.py`: Binary MDX chunk deserializer (`GEOS`, `BONE`, `HELP`, `ATCH`, `EVTS`, `CLID`, `PRE2`, `RIBB`, `TXAN`, `GLBS`, `CAMS`, `LITE`).
   - `mdl.py`: Text `.mdl` parser producing the same `WarCraft3Model` as `parser.py`; `parser.load_mdx()` picks the format from the file header.
-  - `binary.py`: Binary stream reader and low-level glTF 2.0 binary GLB postprocessor (`postprocess_wc3_glb`).
+  - `binary.py`: Low-level binary stream reader (`Reader`) used by both parsers.
   - `blp.py`: Pure-Python `.blp` image decoder supporting both JPEG and DXT1/DXT3/DXT5 compression formats.
   - `importer.py`: Scene generation (mesh geometry, split normals, materials, bone hierarchy, actions, particles, cameras, lights).
-  - `operators.py`: UI operators (`bpy.types.Operator`), GLB export pipelines, sequence playback, and display fixes.
+  - `operators.py`: UI operators (`bpy.types.Operator`), the single `.glb` exporter plus the `postprocess_wc3_glb()` glTF JSON-chunk fixer, sequence playback, and display fixes.
   - `ui.py`: 3D Viewport sidebar panel (`VIEW_3D` -> `UI` -> **WarCraft 3** tab).
   - `classes.py`, `constants.py`, `types.py`, `utils.py`, `preferences.py`: Data models, chunk IDs, and helpers.
-- `godot_tools/`: Companion scripts for Godot 4 projects importing exported GLB files:
-  - `wc3_post_import.gd`: `EditorScenePostImport` script restoring additive blend materials and spawning `GPUParticles3D` on bones.
-  - `wc3_additive.gdshader`: Spatial shader for true additive blending.
-- `godot_addon/warcraft_3_mdx/`: Standalone Godot 4 editor plugin for direct drag-and-drop `.mdx` / `.blp` import.
+- `tools/wc3_glb_viewer/`: Godot 4 viewer scene (`viewer.tscn` + `viewer.gd`) for opening an exported `.glb` and cycling its animations; copy the folder into a Godot project to use. Not part of the addon package.
 - `docs/`: Documentation assets (previews, screenshots).
 
 ---
@@ -54,16 +51,19 @@ Whenever modifying or bumping the version, **always update both files synchronou
 1. `io_scene_warcraft_3/__init__.py`: `bl_info['version'] = (x, y, z)`
 2. `io_scene_warcraft_3/blender_manifest.toml`: `version = "x.y.z"`
 
-### 2. 2-Tier GLB Export Architecture
-- **Lossless GLB (`WARCRAFT_3_OT_export_lossless_glb`)**:
+### 2. Single Engine-Ready GLB Export (`WARCRAFT_3_OT_export_glb`, `warcraft_3.export_glb`)
+- One `.glb` per model, standard glTF 2.0 so any engine can open it without companion code:
   - Splits multi-layer geosets into multiple glTF primitives within a single mesh.
-  - Preserves exact `layerAlpha`, tint color, and `wc3_blend: "additive"` metadata in glTF `extras`.
+  - Preserves exact `layerAlpha`, tint color, and `wc3_blend: "additive"` metadata in glTF `extras` (glTF itself has no additive mode).
   - Exports particle emitter markers (`W3_Emitter_*`) parented to bones carrying emitter parameters in `extras`.
-- **Compatible GLB (`WARCRAFT_3_OT_export_compatible_glb`)**:
-  - Standard glTF PBR approximation (`layerAlpha²` + boosted emission via `KHR_materials_emissive_strength`) for universal viewers (Windows 3D Viewer, web).
+  - One glTF animation per WarCraft 3 sequence (`export_animation_mode='ACTIONS'`).
+  - Additive layers (`filter_mode` 3/4) export a luminance-alpha copy of their texture (`_additive_mask_image`, image name `<texture>_addmask`) because glTF cannot express additive blending and WC3 additive textures keep an opaque-black alpha channel that would darken the background in a stock alpha-blend engine. The copies are purged after the export.
+  - `export_animation_mode='ACTIONS'` exports every action in the .blend (other models included), so `postprocess_wc3_glb(keep_animations=...)` strips every animation not tagged `wc3_armature_name == <exported armature>`.
+- There is deliberately **no** second "compatible" tier and **no** Godot/Unity post-import script in this repo; engines read `extras` if they want exact blending.
 - **Material Swap & Restore**:
   - Export temporarily flattens WC3 custom node graphs into standard glTF-compatible materials.
   - **Crucial**: The original materials must always be restored in a `try...finally` block. Never leave temporary export materials attached to user scene objects.
+- **Layer Animation Contract**: `create_warcraft3_material` names each alpha multiplier node `LayerAlpha_Mat{material}_L{layer}` and records the real layer→node mapping in `model.alpha_node_map` (runtime attribute, never a material property, so it stays out of glTF `extras`); `animate_material_layers` reads that map — a team-color merge moves layer 1's alpha onto the `_L0` node, so index guessing misses it. `make_action_cyclic`/`_iter_action_fcurves` are the only sanctioned way to walk fcurves (Blender <= 4.3 `action.fcurves` vs 4.4+ layer/channelbag nesting).
 - **Binary Postprocessing**:
   - `postprocess_wc3_glb()` enforces glTF 2.0 material properties directly into the exported `.glb` binary chunks and guarantees strict 4-byte alignment.
 

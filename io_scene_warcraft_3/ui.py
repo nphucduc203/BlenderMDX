@@ -61,11 +61,10 @@ class WARCRAFT3_PT_viewport(bpy.types.Panel):
 
         # Game Engine Export Tools
         layout.separator()
-        box_godot = layout.box()
-        box_godot.label(text='Export Model (.glb):', icon='EXPORT')
-        box_godot.operator('warcraft_3.export_lossless_glb', text='Export Lossless GLB + WC3 Extensions', icon='SHADERFX')
-        box_godot.operator('warcraft_3.export_compatible_glb', text='Export Compatible GLB (Standard PBR)', icon='FILE_3D')
-        box_godot.operator('warcraft_3.push_to_nla', text='Push All to NLA Tracks', icon='NLA')
+        box_export = layout.box()
+        box_export.label(text='Export Model (.glb):', icon='EXPORT')
+        box_export.operator('warcraft_3.export_glb', text='Export GLB for Game Engines', icon='SHADERFX')
+        box_export.operator('warcraft_3.push_to_nla', text='Push All to NLA Tracks', icon='NLA')
 
         layout.separator()
         layout.operator('warcraft_3.clean_bone_shapes', text='Fix glTF Display (Hide Spheres)', icon='HIDE_OFF')
@@ -112,11 +111,10 @@ class WARCRAFT3_PT_armature(bpy.types.Panel):
         col.operator('warcraft_3.remove_sequence_to_armature', icon='REMOVE', text='')
 
         layout.separator()
-        box_godot = layout.box()
-        box_godot.label(text='Export Model (.glb):', icon='EXPORT')
-        box_godot.operator('warcraft_3.export_lossless_glb', text='Export Lossless GLB + WC3 Extensions', icon='SHADERFX')
-        box_godot.operator('warcraft_3.export_compatible_glb', text='Export Compatible GLB (Standard PBR)', icon='FILE_3D')
-        box_godot.operator('warcraft_3.push_to_nla', icon='NLA', text='Push All to NLA Tracks')
+        box_export = layout.box()
+        box_export.label(text='Export Model (.glb):', icon='EXPORT')
+        box_export.operator('warcraft_3.export_glb', text='Export GLB for Game Engines', icon='SHADERFX')
+        box_export.operator('warcraft_3.push_to_nla', icon='NLA', text='Push All to NLA Tracks')
 
 
 class WARCRAFT3_PT_bone(bpy.types.Panel):

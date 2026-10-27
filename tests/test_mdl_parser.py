@@ -60,6 +60,20 @@ Materials 1 {
             TextureID 0,
             TVertexAnimId 0,
         }
+        Layer {
+            FilterMode "Blend",
+            Alpha 3 {
+                0: 1.0,
+                500: 0.5,
+                1000: 0.0,
+            },
+            TextureID 2 {
+                Linear,
+                0: 0,
+                500: 1,
+            },
+            TextureAnimID 0,
+        }
     }
 }
 TextureAnims 1 {
@@ -244,12 +258,21 @@ def test_sample():
 
     check(len(model.materials) == 1, 'material count')
     layers = model.materials[0].layers
-    check(len(layers) == 2, 'layer count: {0}'.format(len(layers)))
+    check(len(layers) == 3, 'layer count: {0}'.format(len(layers)))
     check(layers[0].filter_mode == 2 and layers[0].texture_id == 1, 'layer0')
     check(abs(layers[0].alpha - 0.5) < 1e-6, 'layer0 alpha')
     check(layers[0].shading_flags == 0x1 | 0x10, 'layer0 shading flags')
     check(layers[1].filter_mode == 3 and abs(layers[1].alpha - 0.25) < 1e-6, 'layer1')
     check(layers[1].texture_animation_id == 0, 'layer1 texture anim id')
+    # Layer 2 carries the MDX-equivalent KMTA / KMTF tracks and the 'TextureAnimID' alias.
+    kmta = layers[2].material_alpha
+    check(kmta and kmta.tracks_count == 3 and list(kmta.values) == [1.0, 0.5, 0.0],
+          'layer2 alpha track: {0}'.format(kmta))
+    check(abs(layers[2].alpha - 1.0) < 1e-6, 'layer2 static alpha falls back to the first key')
+    kmtf = layers[2].material_texture_id
+    check(kmtf and list(kmtf.values) == [0, 1], 'layer2 flipbook track: {0}'.format(kmtf))
+    check(layers[2].texture_id == 0, 'layer2 texture id from the first flipbook key')
+    check(layers[2].texture_animation_id == 0, 'layer2 TextureAnimID alias')
 
     mesh = model.meshes[0]
     check(len(mesh.vertices) == 3 and mesh.vertices[2] == (7.0, 8.0, 9.0), 'vertices')

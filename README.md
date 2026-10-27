@@ -32,6 +32,7 @@ A modern, high-performance addon for **Blender 4.2, 4.5, and 5.2 LTS** to import
   - Direct native `.blp` image decoding (JPEG & DXT1/DXT3/DXT5 compressed BLP formats).
   - Eliminates black outlines around semi-transparent edges using separate alpha and RGB color math.
   - **Multi-Layer Additive Materials**: Seamlessly layers additive textures (e.g. animated star shimmers, galaxy cloaks) over base diffuse surfaces with real-time UV translation.
+  - **Animated Material Layers**: `KMTA` alpha tracks and TXAN `KTAT`/`KTAS` UV scroll & scale are baked into the shader node tree, so glow fades and scrolling UVs play in the viewport.
 
 - **WarCraft 3 `ParticleEmitter2` Conversion**:
   - Converts WC3 particle emitters into native Blender particle systems in the `"WarCraft 3 Particles"` collection.
@@ -43,8 +44,8 @@ A modern, high-performance addon for **Blender 4.2, 4.5, and 5.2 LTS** to import
   - Dedicated **WarCraft 3** tab in the 3D Viewport sidebar (`N` panel) listing all model sequences (`Stand`, `Walk`, `Attack`, `Spell`, `Death`, etc.).
   - Isolated action naming and automatic purging of orphaned actions, preventing animation collisions when deleting objects or importing multiple models.
 
-- **Godot Engine (.glb) Export**:
-  - One-click exporter to Godot-ready `.glb` with embedded textures, camera, and one NLA track per animation sequence.
+- **Game Engine (.glb) Export**:
+  - One click produces a single standard glTF 2.0 binary: embedded textures, one glTF animation per WarCraft 3 sequence, per-layer primitives, and `wc3_*` extras (blend mode, layer alpha, tint, emitter parameters) for engines that want to restore additive blending or spawn particles.
   - Exports only the model itself (armature + meshes + camera/lights) — Blender-side particle preview helpers never leak into the file.
   - WC3 shader nodes that glTF cannot represent are temporarily flattened to `texture → Base Color / Alpha / Emission` so textures always survive the export; your original materials are restored afterwards.
 
@@ -93,16 +94,41 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 4. Click any sequence in the **Animation Sequences** list to play!
 
 ### Exporting to Game Engines (.glb)
-1. In the **WarCraft 3** sidebar tab, choose your export mode:
-   - **Export Lossless GLB (WC3 Extensions)**: Industry-standard 2-tier architecture. 1 geoset splits into N glTF primitives for all multi-layer materials (e.g. skin + glow + star shimmer). Preserves exact layerAlpha and additive metadata in `extras` for Godot, Unity, Unreal with custom shaders. Zero black plates, 100% layer fidelity.
-   - **Export Compatible GLB (Standard PBR)**: Standard glTF PBR for universal 3D viewers (Windows 3D Viewer, web). Uses frozen approximation formulas (`layerAlpha²` + boosted emission).
-2. **Previewing the GLB in Blender**: Blender's glTF importer draws each bone as a stretched octahedron with an Icosphere custom shape. This is a *display artifact of the importer* — the shapes are not in the file and Godot does not show them. Press **Fix glTF Display (Hide Spheres)** in the WarCraft 3 tab to clean the viewport.
+1. In the **WarCraft 3** sidebar tab, press **Export GLB for Game Engines** (or `File > Export > WarCraft 3 (.glb)`). One standard glTF 2.0 file is produced:
+   - 1 geoset with N layers exports as N primitives in a single glTF mesh (skin + glow + star shimmer stay separate surfaces).
+   - Exact `layerAlpha`, tint and `wc3_blend: "additive"` ride in `extras`; additive layers are `BLEND` + `doubleSided` + `KHR_materials_emissive_strength`.
+   - Every WarCraft 3 sequence becomes its own glTF animation, and each `ParticleEmitter2` stays a named `W3_Emitter_*` node on its bone carrying its emitter parameters, so an engine can spawn particles from it.
+   - glTF has no additive blend mode, so a glow layer reads as alpha-blended emission unless the engine opts into the `extras` hint.
+2. **Previewing the GLB in Blender**: Blender's glTF importer draws each bone as a stretched octahedron with an Icosphere custom shape. This is a *display artifact of the importer* — the shapes are not in the file and game engines do not show them. Press **Fix glTF Display (Hide Spheres)** in the WarCraft 3 tab to clean the viewport.
 
 > **Note**: both `.mdx` (binary) and `.mdl` (text) are imported through the same menu — the format is detected from the file itself, not the extension.
+
+### Checking an exported .glb (Godot viewer)
+`tools/wc3_glb_viewer/` is a self-contained Godot 4 scene for inspecting what the exporter actually produced:
+1. Copy the folder into your Godot project, so it becomes `res://wc3_glb_viewer/`.
+2. Run `viewer.tscn` (or make it the main scene). It loads `res://wc3_export_test/2_95.glb` when that file exists, otherwise it opens a file dialog; `--model=res://path/file.glb` also works.
+   The `.glb` is parsed at runtime with `GLTFDocument`, so it needs no Godot `.import` cache and any absolute path on disk (`D:\...\model.glb`) opens directly.
+3. Keys: `O` open another `.glb`, `←`/`→` (or `A`/`D`) previous/next sequence, `Space` pause, drag to orbit, wheel to zoom, `F` re-frame. Every sequence is forced to `LOOP_LINEAR`, so it keeps animating instead of playing once. The status bar prints the mesh / surface / animation / bone counts the file really contains, which catches silent export losses immediately.
+
+> **Lưu ý**: bản `.mdl` (văn bản) cũng nhập qua cùng menu — định dạng được nhận từ nội dung file, không phải phần đuôi.
 
 ---
 
 ## 📋 Changelog
+
+### v1.9.0
+- **One export, one file**: *Export Lossless GLB* and *Export Compatible GLB* are replaced by a single **Export GLB for Game Engines** (`File > Export > WarCraft 3 (.glb)`, `warcraft_3.export_glb`). The result is standard glTF 2.0: per-layer primitives, exact `layerAlpha`/tint/`wc3_blend` in `extras`, `KHR_materials_emissive_strength` on additive layers, one animation per sequence, and named `W3_Emitter_*` nodes on bones carrying emitter parameters.
+- **Removed**: the third `warcraft_3.export_godot_glb` operator, the companion `godot_tools/` post-import scripts and the standalone `godot_addon/warcraft_3_mdx` Godot plugin. Nothing in the Blender addon referenced them.
+- **Additive layers fixed for stock engines**: glTF has no additive mode, and WarCraft 3 additive textures carry an *unused* alpha channel (opaque black outside the glow), so a plain alpha blend painted dark grey plates over the scene. The exporter now writes a luminance-alpha copy of those textures (`<texture>_addmask`), so any engine that only knows `BLEND` adds light instead of darkening. Verified in Godot 4.7.2 on `2 (95).mdx`: the halo layers changed from dark wedges to a soft glow, at +0.45 MB.
+- **Exporting from a scene that holds several models no longer leaks their animations**: glTF's "all actions" mode exports every action in the .blend, so the postprocessor keeps only the animations tagged as sequences of the armature being exported.
+- Verified end to end: `2 (95).mdx` → 3.7 MB GLB → Godot 4.7.2 shows 14 meshes / 28 surfaces, 15 emissive surfaces and 11 animations (Attack 1.000 s, Death 2.000 s, Stand 1.333 s, …) with the skeleton really posing — `Bone_Hand_L` moves between sampled frames. Re-opening the same GLB in Blender returns all 102 bones, 28 material slots and 11 actions.
+- Known glTF limit: additive glow layers arrive as alpha-blended emission (`BLEND_MODE_MIX`) because glTF 2.0 has no additive mode; an engine can flip them from `extras.wc3_blend == "additive"`.
+
+### v1.8.0
+- **Animated layer alpha (`KMTA`)**: a layer's alpha track now keyframes that layer's alpha multiplier in the shader graph. The track value *replaces* the static layer alpha (it is never multiplied by it), and step/linear interpolation is kept — 151 such tracks exist in the classic corpus (glow pulses, shimmer fades).
+- **Layer alpha works for `.mdl` too**: text models feed the same `layer.material_alpha` field, plus the `TextureAnimID` spelling of a layer's texture animation.
+- **Texture-animation scale (`KTAS`)**: TXAN scale tracks drive the Mapping node's Scale next to Location.
+- Known limits: `KMTF` flipbook frames are not keyframed (Blender 5.2 rejects animating an image node's `image` property, so the layer keeps its first frame), `KTAR` UV rotation is not applied, and the extra layers of an AddAlpha/Modulate primary material remain export metadata (`wc3_sec_layers`) rather than a live second shader.
 
 ### v1.7.0
 - **Text `.mdl` import**: `File > Import > WarCraft 3 (.mdx, .mdl)` reads the text format through the same pipeline — geosets, layers, bones/helpers/attachments, animation tracks (with or without the `LineType` keyword), pivot points, and the `PRE2` / `RIBB` / `Light` / `Camera` / `CollisionShape` / `EventObject` blocks. The format is sniffed from the file contents, so a mislabelled extension still imports.
@@ -203,8 +229,8 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
   - Tab **WarCraft 3** riêng trong sidebar viewport (`N`) liệt kê mọi sequence của model (`Stand`, `Walk`, `Attack`, `Spell`, `Death`,...).
   - Đặt tên action cách ly và tự động dọn action mồ côi, tránh xung đột animation khi xóa object hoặc import nhiều model.
 
-- **Xuất sang Godot (.glb)**:
-  - Xuất `.glb` sẵn sàng cho Godot chỉ với một cú click, kèm texture nhúng, camera và mỗi sequence là một NLA track riêng.
+- **Xuất sang Game Engine (.glb)**:
+  - Một cú click tạo duy nhất một file glTF 2.0 chuẩn: texture nhúng, mỗi sequence WarCraft 3 là một animation riêng, geoset nhiều layer thành nhiều primitive, kèm `extras` (`wc3_blend`, `wc3_layer_alpha`, `wc3_tint`, tham số emitter) để engine phục hồi blending cộng màu hoặc sinh hạt.
   - Chỉ xuất đúng model (armature + mesh + camera/đèn) — các object preview hạt phía Blender không bao giờ lọt vào file.
   - Các node shader WC3 mà glTF không biểu diễn được sẽ được "làm phẳng" tạm thời thành `texture → Base Color / Alpha / Emission` để texture luôn giữ được khi xuất; material gốc của bạn được phục hồi nguyên vẹn sau đó.
 
@@ -253,10 +279,12 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 4. Bấm vào bất kỳ sequence trong danh sách **Animation Sequences** để phát!
 
 ### Xuất sang Game Engine (.glb)
-1. Trong tab sidebar **WarCraft 3**, chọn chế độ xuất:
-   - **Export Lossless GLB (WC3 Extensions)**: Kiến trúc 2 tầng chuẩn công nghiệp. 1 geoset có N layer được xuất thành N primitive trong cùng 1 mesh glTF (ví dụ skin + glow + star shimmer). Giữ nguyên layerAlpha và metadata additive trong `extras` cho Godot, Unity, Unreal kèm custom shader. Không tấm đen, giữ nguyên 100% layer.
-   - **Export Compatible GLB (Standard PBR)**: Định dạng glTF PBR chuẩn cho các trình xem 3D phổ thông (Windows 3D Viewer, web). Sử dụng công thức xấp xỉ cố định (`layerAlpha²` + emission tăng cường).
-2. **Xem trước GLB bằng Blender**: glTF importer của Blender vẽ mỗi bone thành khung bát diện giãn dài kèm hình Icosphere. Đây là *artifact hiển thị của importer* — các hình này không nằm trong file và Godot không hiển thị chúng. Bấm **Fix glTF Display (Hide Spheres)** trong tab WarCraft 3 để dọn sạch viewport.
+1. Trong tab sidebar **WarCraft 3**, bấm **Export GLB for Game Engines** (hoặc `File > Export > WarCraft 3 (.glb)`). Chỉ một file glTF 2.0 chuẩn được tạo ra:
+   - 1 geoset có N layer xuất thành N primitive trong cùng 1 mesh glTF (skin + glow + star shimmer vẫn là các surface riêng).
+   - `layerAlpha` gốc, màu tint và `wc3_blend: "additive"` nằm trong `extras`; layer additive là `BLEND` + `doubleSided` + `KHR_materials_emissive_strength`.
+   - Mỗi sequence WarCraft 3 thành một glTF animation riêng; mỗi `ParticleEmitter2` ở lại thành node `W3_Emitter_*` gắn trên bone kèm tham số emitter để engine sinh hạt.
+   - glTF không có chế độ cộng màu, nên lớp phát sáng hiển thị như alpha-blend + emission trừ khi engine đọc `extras`.
+2. **Xem trước GLB bằng Blender**: glTF importer của Blender vẽ mỗi bone thành khung bát diện giãn dài kèm hình Icosphere. Đây là *artifact hiển thị của importer* — các hình này không nằm trong file và game engine không hiển thị chúng. Bấm **Fix glTF Display (Hide Spheres)** trong tab WarCraft 3 để dọn sạch viewport.
 
 > **Lưu ý**: cả `.mdx` (nhị phân) và `.mdl` (văn bản) đều nhập qua cùng một menu — định dạng được nhận từ nội dung file, không phải phần đuôi.
 
@@ -264,6 +292,16 @@ git clone https://github.com/nphucduc203/BlenderMDX.git
 
 ## 📋 Lịch sử thay đổi (Tóm tắt)
 
+- **v1.9.0** — Một exporter duy nhất, bỏ toàn bộ phần Godot companion:
+  - *Export Lossless* + *Export Compatible* gộp thành **Export GLB for Game Engines** (`warcraft_3.export_glb`): glTF 2.0 chuẩn, mỗi layer một primitive, `layerAlpha`/tint/`wc3_blend` trong `extras`, emission cho layer additive, mỗi sequence một animation, node `W3_Emitter_*` trên bone.
+  - Xoá operator thứ ba `warcraft_3.export_godot_glb`, thư mục `godot_tools/` và addon Godot `godot_addon/warcraft_3_mdx` (Blender addon không tham chiếu chúng).
+  - Đã kiểm chứng: `2 (95).mdx` → GLB 3.3 MB → Godot 4.7.2 hiển thị 14 mesh / 28 surface, 15 surface phát sáng, 11 animation, xương cử động thật.
+  - Giới hạn glTF: lớp additive vào Godot là `BLEND_MODE_MIX` + emission (glTF không có chế độ cộng màu); engine có thể tự bật qua `extras.wc3_blend`.
+- **v1.8.0** — Animation lớp vật liệu:
+  - Track alpha `KMTA` của layer nay được keyframe lên node nhân alpha trong shader graph; giá trị track **thay thế** alpha tĩnh (không nhân thêm) và giữ kiểu nội suy step/linear.
+  - `.mdl` cũng cấp cùng trường `material_alpha`, nhận thêm tên `TextureAnimID` cho TVertexAnim của layer.
+  - Track scale `KTAS` của TXAN điều khiển `Scale` của Mapping node bên cạnh `Location`.
+  - Giới hạn: flipbook `KMTF` chưa keyframe (Blender 5.2 không cho animate thuộc tính `image` của node ảnh), `KTAR` chưa áp dụng, layer phụ của material AddAlpha/Modulate vẫn chỉ là metadata export `wc3_sec_layers`.
 - **v1.7.0** — Nhập định dạng văn bản `.mdl` và sửa lỗi đọc MDX:
   - `.mdx` (nhị phân) và `.mdl` (văn bản) dùng chung một pipeline; định dạng được nhận từ nội dung file.
   - Geoset đọc theo tag (`VRTX/NRMS/PVTX/GNDX/MTGC/MATS/UVAS/UVBS`) nên không còn hỏng khi thứ tự khác trình của Blizzard.

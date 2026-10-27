@@ -374,7 +374,8 @@ def _parse_layer(t):
     else:
         layer.texture_id = int(_scalar(texture_id, 0))
     layer.coord_id = int(_scalar(props.get('CoordId'), 0))
-    animation_id = props.get('TVertexAnimId')
+    # 'TVertexAnimId' is the classic spelling; other writers use the MDX-ish 'TextureAnimID'.
+    animation_id = props.get('TVertexAnimId', props.get('TextureAnimID'))
     layer.texture_animation_id = None if animation_id is None else int(_scalar(animation_id, 0))
     for keyword, bit in SHADING_FLAGS.items():
         if props.get(keyword):

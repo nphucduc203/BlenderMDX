@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "io_scene_warcraft_3"
-version = "1.7.0"
+version = "1.9.0"
 name = "WarCraft 3 .mdx Importer & Game Engine .glb Exporter"
 tagline = "Import *.mdx / *.mdl models and export full multi-layer *.glb for Game Engines"
 maintainer = "nphucduc203, Torenjk, Pavel_Blend, Nekuromu"
